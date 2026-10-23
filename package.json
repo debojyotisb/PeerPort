@@ -1,0 +1,21 @@
+{
+  "name": "peerport-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cross-Platform P2P File-Sharing Application",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace=apps/web",
+    "dev:server": "npm run dev --workspace=apps/signaling-server",
+    "dev:companion": "npm run dev --workspace=apps/native-companion",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  }
+}
