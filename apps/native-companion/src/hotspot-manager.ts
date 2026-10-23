@@ -59,3 +59,4 @@ export class HotspotManager {
     return this.currentSession;
   }
 }
+

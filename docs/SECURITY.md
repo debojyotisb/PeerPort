@@ -42,3 +42,4 @@
 * **Mitigation**:
   - Every session negotiation includes a random 128-bit session nonce and a timestamp with a 60-second validity window.
   - Handshake messages with expired timestamps or replayed nonces are rejected.
+

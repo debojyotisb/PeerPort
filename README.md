@@ -80,3 +80,4 @@ npm run test
 - **Hardware SHA-256 Verification**: Every file payload is validated against a cryptographic digest via the Web Crypto API.
 - **Memory Safety**: Files are streamed in 64 KiB chunks with backpressure; multi-gigabyte files never exhaust browser RAM.
 - **Path Traversal Protection**: All filenames are stripped of `../`, control codes, and Windows reserved device names (`CON`, `NUL`, etc.).
+

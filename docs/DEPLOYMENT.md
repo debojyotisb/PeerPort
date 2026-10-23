@@ -57,3 +57,4 @@ On Android devices:
 1. Wrap the companion as a lightweight foreground Android Service (using Android Studio / Kotlin or Capacitor background plugin).
 2. The service calls `WifiManager.startLocalOnlyHotspot(...)` and binds the embedded Node/Go micro-server to port `8080`.
 3. The React web UI interacts with `http://127.0.0.1:8080/api/hotspot/start` locally.
+

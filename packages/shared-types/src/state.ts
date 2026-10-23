@@ -27,3 +27,4 @@ export interface DeviceInfo {
   browser?: string;
   isNativeCompanion?: boolean;
 }
+

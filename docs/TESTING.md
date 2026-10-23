@@ -41,3 +41,4 @@ npm run test
 | **Scenario C: Android ➔ Android** | WebRTC P2P or Local Hotspot | Same Wi-Fi or Hotspot | Direct high-speed local stream. |
 | **Scenario D: Android ➔ PC (Windows/Mac)** | WebRTC DataChannel / Browser QR | Same LAN or Internet | Browser client connects, verifies SHA-256, downloads directly. |
 | **Scenario E: Zero-Install Receiver** | Web Browser (Safari, Chrome, Edge) | Offline Hotspot or Internet Link | Receiver needs **zero app installation** to receive and save files. |
+

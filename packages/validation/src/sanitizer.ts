@@ -47,3 +47,4 @@ export function sanitizeFileName(name: string): string {
 export function isValidFileSize(size: number, maxBytes: number = 10 * 1024 * 1024 * 1024): boolean {
   return Number.isFinite(size) && size >= 0 && size <= maxBytes;
 }
+

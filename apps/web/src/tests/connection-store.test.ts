@@ -50,3 +50,4 @@ describe('Connection Store & State Machine Transitions', () => {
     expect(updated.errorMessage).toBeNull();
   });
 });
+

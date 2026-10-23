@@ -7,3 +7,4 @@ companion.listen().catch((err) => {
   console.error('Failed to start native companion server:', err);
   process.exit(1);
 });
+

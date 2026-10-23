@@ -3,11 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "description": "Cross-Platform P2P File-Sharing Application",
+  "type": "module",
   "workspaces": [
     "packages/*",
     "apps/*"
   ],
   "scripts": {
+    "dev": "node scripts/dev.js",
     "dev:web": "npm run dev --workspace=apps/web",
     "dev:server": "npm run dev --workspace=apps/signaling-server",
     "dev:companion": "npm run dev --workspace=apps/native-companion",
@@ -19,3 +21,4 @@
     "typescript": "^5.3.3"
   }
 }
+

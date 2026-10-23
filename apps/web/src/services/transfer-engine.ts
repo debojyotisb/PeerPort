@@ -116,3 +116,4 @@ export class TransferEngine {
     this.isCancelled = true;
   }
 }
+

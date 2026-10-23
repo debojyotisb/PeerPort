@@ -72,3 +72,4 @@ export const useTransferStore = create<TransferStoreState>((set) => ({
       isVerifyingIntegrity: false
     })
 }));
+

@@ -163,3 +163,4 @@ export const QrModal: React.FC<QrModalProps> = ({ isOpen, onClose, onJoinRoom })
     </div>
   );
 };
+

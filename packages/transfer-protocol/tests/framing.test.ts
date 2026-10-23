@@ -48,3 +48,4 @@ describe('Transfer Protocol Binary Framing', () => {
     expect(() => decodeChunk(tooSmall)).toThrow(/less than header size/);
   });
 });
+

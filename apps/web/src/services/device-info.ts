@@ -49,3 +49,4 @@ function getBrowserName(ua: string): string {
   if (/edg/i.test(ua)) return 'Edge';
   return 'Browser';
 }
+

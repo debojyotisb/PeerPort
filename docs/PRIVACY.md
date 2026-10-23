@@ -8,3 +8,4 @@ PeerPort is engineered with a strict **Privacy-First** posture:
 4. **No Directory Browsing**: Neither peer can explore the other's file system. Only explicitly selected files are visible in the offer manifest.
 5. **Clear Network Transparency**: When an internet-assisted relay is in use, PeerPort explicitly alerts the user with a distinct badge.
 6. **Instant Clean-up**: On session completion, all temporary object URLs, cryptographic keys, and connection instances are revoked and garbage-collected.
+

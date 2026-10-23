@@ -54,3 +54,4 @@ export function buildWifiQrString(ssid: string, password?: string, hidden = fals
 function escapeQrField(val: string): string {
   return val.replace(/([\\;,":])/g, '\\$1');
 }
+

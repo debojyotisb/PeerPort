@@ -85,3 +85,4 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenHelp }) => {
     </header>
   );
 };
+

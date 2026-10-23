@@ -89,3 +89,4 @@ PeerPort tracks connection states using an immutable, validated transition table
 | `COMPLETED` | `IDLE` | Reset / New transfer |
 | `REJECTED` | `IDLE` | Reset |
 | `FAILED` | `IDLE`, `CONNECTING` | Retry or Reset |
+

@@ -32,3 +32,4 @@ describe('Sanitizer Security Controls', () => {
     expect(isValidFileSize(100 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024)).toBe(false);
   });
 });
+

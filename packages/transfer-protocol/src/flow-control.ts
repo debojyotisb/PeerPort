@@ -47,3 +47,4 @@ export class SpeedCalculator {
     this.smoothedSpeed = 0;
   }
 }
+

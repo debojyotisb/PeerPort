@@ -60,3 +60,4 @@ export interface TransferProgress {
   speedBytesPerSec: number;
   timeRemainingSec: number;
 }
+

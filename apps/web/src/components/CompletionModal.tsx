@@ -78,3 +78,4 @@ export const CompletionModal: React.FC<CompletionModalProps> = ({
     </div>
   );
 };
+

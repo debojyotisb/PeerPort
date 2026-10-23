@@ -270,3 +270,4 @@ All chunks sent over WebRTC DataChannel or WebSocket follow a fixed 32-byte bina
 | **TURN Relay (Optional)** | Symmetric NAT fallback | Metered coturn / Open Source Coturn on VPS | $0 (Self-hosted) or pay-as-you-go |
 | **Offline Sharing (Scenario A)** | Android to iOS direct transfer | Device-to-device local Wi-Fi Hotspot | **$0 (Zero infrastructure)** |
 | **File Storage Cloud** | Payload storage | **None** (PeerPort never stores files in cloud) | **$0** |
+

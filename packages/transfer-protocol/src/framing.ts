@@ -89,3 +89,4 @@ export function decodeChunk(raw: ArrayBuffer | Uint8Array): BinaryChunk {
 
   return { header, data };
 }
+

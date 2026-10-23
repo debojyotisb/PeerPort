@@ -33,3 +33,4 @@ describe('Native Companion & Offline Hotspot Logic', () => {
     expect(manager.getSession()).toBeNull();
   });
 });
+
