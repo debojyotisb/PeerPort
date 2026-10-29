@@ -24,6 +24,7 @@ export class WebRtcTransport implements PeerTransport {
   private targetPeerId: string | null = null;
   private signalingUrl: string;
   private iceServers: RTCIceServer[];
+  private pendingIceCandidates: RTCIceCandidateInit[] = [];
 
   private listeners = {
     onPeerFound: new Set<(peer: DiscoveredPeer) => void>(),
@@ -33,19 +34,21 @@ export class WebRtcTransport implements PeerTransport {
     onTransferResponse: new Set<(response: TransferResponse) => void>(),
     onProgress: new Set<(progress: TransferProgress) => void>(),
     onTransferComplete: new Set<(fileId: string, sha256: string) => void>(),
-    onError: new Set<(error: Error) => void>()
+    onError: new Set<(error: Error) => void>(),
+    onChunkReceived: new Set<(chunk: BinaryChunk) => void>(),
+    onChannelReady: new Set<() => void>()
   };
 
   constructor(signalingUrl?: string, iceServers?: RTCIceServer[]) {
-    // Default to configured signaling url or local fallback
     this.signalingUrl =
       signalingUrl ||
-      (typeof import.meta !== 'undefined' && import.meta.env?.VITE_SIGNALING_SERVER_URL) ||
+      (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_SIGNALING_SERVER_URL) ||
       `ws://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8088`;
 
     this.iceServers = iceServers || [
       { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' }
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' }
     ];
   }
 
@@ -92,7 +95,7 @@ export class WebRtcTransport implements PeerTransport {
       };
 
       this.ws.onerror = (err) => {
-        this.updateState('FAILED', 'Signaling server connection error');
+        this.updateState('FAILED', 'Signaling service connection error');
         for (const l of this.listeners.onError) l(new Error('Signaling server unavailable'));
         reject(err);
       };
@@ -131,14 +134,13 @@ export class WebRtcTransport implements PeerTransport {
     this.peerConnection = new RTCPeerConnection({ iceServers: this.iceServers });
     this.setupPeerConnectionEvents();
 
-    // Create reliable unordered DataChannel for binary chunks
+    // Use reliable ordered DataChannel for accurate chunk transmission
     this.dataChannel = this.peerConnection.createDataChannel('peerport-data', {
-      ordered: false,
-      maxRetransmits: 30
+      ordered: true
     });
     this.setupDataChannelEvents(this.dataChannel);
 
-    // Create and send SDP Offer
+    // Create and dispatch SDP Offer
     const offer = await this.peerConnection.createOffer();
     await this.peerConnection.setLocalDescription(offer);
 
@@ -245,17 +247,24 @@ export class WebRtcTransport implements PeerTransport {
 
   async close(): Promise<void> {
     if (this.dataChannel) {
-      this.dataChannel.close();
+      try {
+        this.dataChannel.close();
+      } catch {}
       this.dataChannel = null;
     }
     if (this.peerConnection) {
-      this.peerConnection.close();
+      try {
+        this.peerConnection.close();
+      } catch {}
       this.peerConnection = null;
     }
     if (this.ws) {
-      this.ws.close();
+      try {
+        this.ws.close();
+      } catch {}
       this.ws = null;
     }
+    this.pendingIceCandidates = [];
     this.updateState('IDLE');
   }
 
@@ -276,7 +285,7 @@ export class WebRtcTransport implements PeerTransport {
           roomId: this.currentRoomId || 'default',
           senderId: localDevice.deviceId,
           targetId: this.targetPeerId || undefined,
-          payload: { candidate: event.candidate },
+          payload: { candidate: event.candidate.toJSON() },
           timestamp: Date.now()
         });
       }
@@ -289,7 +298,9 @@ export class WebRtcTransport implements PeerTransport {
 
     this.peerConnection.onconnectionstatechange = () => {
       const state = this.peerConnection?.connectionState;
-      if (state === 'failed' || state === 'disconnected') {
+      if (state === 'connected') {
+        // Direct peer connection established
+      } else if (state === 'failed' || state === 'disconnected') {
         this.updateState('DISCONNECTED', `WebRTC state: ${state}`);
       }
     };
@@ -299,14 +310,21 @@ export class WebRtcTransport implements PeerTransport {
     channel.binaryType = 'arraybuffer';
 
     channel.onopen = () => {
-      if (this.connectionState === 'CONNECTING') {
-        this.updateState('IDLE'); // Ready for transfer request
+      for (const listener of this.listeners.onChannelReady) {
+        listener();
       }
     };
 
     channel.onclose = () => {
       if (this.connectionState === 'TRANSFERRING') {
-        this.updateState('DISCONNECTED', 'Data channel closed abruptly');
+        this.updateState('DISCONNECTED', 'Data channel closed');
+      }
+    };
+
+    channel.onerror = (err) => {
+      console.error('DataChannel error:', err);
+      for (const listener of this.listeners.onError) {
+        listener(new Error('DataChannel error'));
       }
     };
 
@@ -314,8 +332,9 @@ export class WebRtcTransport implements PeerTransport {
       try {
         const decoded = decodeChunk(event.data);
         if (decoded.header.messageType === ChunkMessageType.DATA) {
-          // Handled by transfer engine receiver stream
-          (this as any)._onDataChunk?.(decoded);
+          for (const listener of this.listeners.onChunkReceived) {
+            listener(decoded);
+          }
         }
       } catch (err) {
         console.error('Error decoding chunk over DataChannel:', err);
@@ -323,13 +342,28 @@ export class WebRtcTransport implements PeerTransport {
     };
   }
 
+  private async drainPendingIceCandidates() {
+    if (!this.peerConnection || !this.peerConnection.remoteDescription) return;
+
+    while (this.pendingIceCandidates.length > 0) {
+      const candidateInit = this.pendingIceCandidates.shift();
+      if (candidateInit) {
+        try {
+          await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidateInit));
+        } catch (err) {
+          console.warn('Failed to add queued ICE candidate:', err);
+        }
+      }
+    }
+  }
+
   private async handleSignalingMessage(msg: SignalingMessage<any>) {
     const localDevice = getLocalDeviceInfo();
 
     switch (msg.type) {
       case 'ROOM_JOINED': {
-        const payload = msg.payload;
-        if (payload.existingPeers?.length > 0) {
+        const payload = msg.payload as any;
+        if (payload?.existingPeers?.length > 0) {
           const peer = payload.existingPeers[0];
           this.targetPeerId = peer.deviceId;
           for (const l of this.listeners.onPeerFound) {
@@ -345,15 +379,26 @@ export class WebRtcTransport implements PeerTransport {
       }
 
       case 'PEER_JOINED': {
-        const peer = msg.payload.device;
-        this.targetPeerId = peer.deviceId;
-        for (const l of this.listeners.onPeerFound) {
-          l({
-            id: peer.deviceId,
-            device: peer,
-            mode: 'WEBRTC_P2P',
-            lastSeen: Date.now()
-          });
+        const payload = msg.payload as any;
+        const peer = payload?.device;
+        if (peer) {
+          this.targetPeerId = peer.deviceId;
+          for (const l of this.listeners.onPeerFound) {
+            l({
+              id: peer.deviceId,
+              device: peer,
+              mode: 'WEBRTC_P2P',
+              lastSeen: Date.now()
+            });
+          }
+        }
+        break;
+      }
+
+      case 'PEER_LEFT': {
+        if (this.targetPeerId === msg.senderId) {
+          this.targetPeerId = null;
+          this.updateState('DISCONNECTED', 'Peer left the session');
         }
         break;
       }
@@ -364,7 +409,10 @@ export class WebRtcTransport implements PeerTransport {
         this.peerConnection = new RTCPeerConnection({ iceServers: this.iceServers });
         this.setupPeerConnectionEvents();
 
-        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(msg.payload.sdp));
+        const payload = msg.payload as any;
+        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+        await this.drainPendingIceCandidates();
+
         const answer = await this.peerConnection.createAnswer();
         await this.peerConnection.setLocalDescription(answer);
 
@@ -381,20 +429,33 @@ export class WebRtcTransport implements PeerTransport {
 
       case 'ANSWER': {
         if (this.peerConnection) {
-          await this.peerConnection.setRemoteDescription(new RTCSessionDescription(msg.payload.sdp));
+          const payload = msg.payload as any;
+          await this.peerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+          await this.drainPendingIceCandidates();
         }
         break;
       }
 
       case 'ICE_CANDIDATE': {
-        if (this.peerConnection && msg.payload.candidate) {
-          await this.peerConnection.addIceCandidate(new RTCIceCandidate(msg.payload.candidate));
+        const payload = msg.payload as any;
+        if (payload?.candidate) {
+          if (this.peerConnection && this.peerConnection.remoteDescription) {
+            try {
+              await this.peerConnection.addIceCandidate(new RTCIceCandidate(payload.candidate));
+            } catch (err) {
+              console.warn('Error adding ICE candidate directly:', err);
+            }
+          } else {
+            // Queue candidate until setRemoteDescription completes
+            this.pendingIceCandidates.push(payload.candidate);
+          }
         }
         break;
       }
 
       case 'TRANSFER_OFFER': {
-        const manifest = msg.payload.manifest as TransferManifest;
+        const payload = msg.payload as any;
+        const manifest = payload.manifest as TransferManifest;
         this.updateState('AWAITING_APPROVAL');
 
         for (const l of this.listeners.onTransferRequest) {
@@ -411,9 +472,10 @@ export class WebRtcTransport implements PeerTransport {
 
       case 'TRANSFER_ACCEPT': {
         this.updateState('TRANSFERRING');
+        const payload = msg.payload as any;
         for (const l of this.listeners.onTransferResponse) {
           l({
-            transferId: msg.payload.transferId,
+            transferId: payload.transferId,
             accepted: true,
             timestamp: Date.now()
           });
@@ -423,11 +485,12 @@ export class WebRtcTransport implements PeerTransport {
 
       case 'TRANSFER_REJECT': {
         this.updateState('REJECTED');
+        const payload = msg.payload as any;
         for (const l of this.listeners.onTransferResponse) {
           l({
-            transferId: msg.payload.transferId,
+            transferId: payload.transferId,
             accepted: false,
-            reason: msg.payload.reason,
+            reason: payload.reason,
             timestamp: Date.now()
           });
         }
@@ -440,7 +503,8 @@ export class WebRtcTransport implements PeerTransport {
       }
 
       case 'ERROR': {
-        this.updateState('FAILED', msg.payload?.message);
+        const payload = msg.payload as any;
+        this.updateState('FAILED', payload?.message);
         break;
       }
     }

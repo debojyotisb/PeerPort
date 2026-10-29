@@ -3,7 +3,9 @@ import {
   FileMetadata,
   BinaryChunk,
   ChunkHeader,
-  TransferProgress
+  TransferProgress,
+  PeerTransport,
+  PeerConnection
 } from '@peerport/shared-types';
 import {
   DEFAULT_FLOW_CONFIG,
@@ -12,22 +14,28 @@ import {
   computeSha256
 } from '@peerport/transfer-protocol';
 import { createFileMetadata } from './file-selection.js';
-import { getLocalDeviceInfo } from './device-info.js';
-import { PeerTransport, PeerConnection } from '@peerport/shared-types';
+import { getLocalDeviceInfo, generateSecureId } from './device-info.js';
+import { CompletedFileRecord } from '../state/transfer-store.js';
 
 export class TransferEngine {
   private isCancelled = false;
   private speedCalc = new SpeedCalculator();
 
+  // Receiver state
+  private activeManifest: TransferManifest | null = null;
+  private fileChunks = new Map<string, Map<number, Uint8Array>>();
+  private fileReceivedBytes = new Map<string, number>();
+  private completedFileIds = new Set<string>();
+
   /**
-   * Generates a signed TransferManifest for a list of files.
+   * Generates a signed TransferManifest for a list of files using cryptographically secure IDs.
    */
   createManifest(files: File[]): TransferManifest {
     const localDevice = getLocalDeviceInfo();
     const fileMetadatas: FileMetadata[] = files.map((f) => createFileMetadata(f));
     const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
-    const transferId = `tr_${Math.random().toString(36).substring(2, 12)}`;
-    const token = Math.random().toString(36).substring(2, 16);
+    const transferId = generateSecureId('tr');
+    const token = generateSecureId('tok');
 
     return {
       transferId,
@@ -106,14 +114,122 @@ export class TransferEngine {
       });
     }
 
-    // Compute final hash
+    // Compute hardware SHA-256
     const fullBuffer = await file.arrayBuffer();
     const sha256 = await computeSha256(fullBuffer);
     return sha256;
   }
 
+  /**
+   * Initializes the receiving engine for an incoming manifest.
+   */
+  prepareReceiver(manifest: TransferManifest) {
+    this.activeManifest = manifest;
+    this.fileChunks.clear();
+    this.fileReceivedBytes.clear();
+    this.completedFileIds.clear();
+    this.speedCalc.reset();
+    this.isCancelled = false;
+
+    for (const f of manifest.files) {
+      this.fileChunks.set(f.id, new Map());
+      this.fileReceivedBytes.set(f.id, 0);
+    }
+  }
+
+  /**
+   * Processes an incoming binary chunk on the receiver side.
+   * Returns a CompletedFileRecord if this chunk completed a file.
+   */
+  async handleIncomingChunk(
+    chunk: BinaryChunk,
+    onProgress: (progress: TransferProgress) => void
+  ): Promise<CompletedFileRecord | null> {
+    if (this.isCancelled || !this.activeManifest) return null;
+
+    const { header, data } = chunk;
+
+    // Validate transferId matches current active transfer
+    const manifestPrefix = this.activeManifest.transferId.slice(0, 16);
+    if (!header.transferId.startsWith(manifestPrefix) && !manifestPrefix.startsWith(header.transferId)) {
+      return null;
+    }
+
+    // Find corresponding file metadata
+    const fileIndex = this.activeManifest.files.findIndex(
+      (f) => f.id.slice(0, 12) === header.fileId || f.id === header.fileId
+    );
+    if (fileIndex === -1) return null;
+
+    const fileMeta = this.activeManifest.files[fileIndex];
+    let chunksMap = this.fileChunks.get(fileMeta.id);
+    if (!chunksMap) {
+      chunksMap = new Map();
+      this.fileChunks.set(fileMeta.id, chunksMap);
+    }
+
+    // Prevent duplicate chunk insertion
+    if (!chunksMap.has(header.chunkIndex)) {
+      chunksMap.set(header.chunkIndex, data);
+      const prevBytes = this.fileReceivedBytes.get(fileMeta.id) || 0;
+      const currentBytes = prevBytes + data.byteLength;
+      this.fileReceivedBytes.set(fileMeta.id, currentBytes);
+
+      // Report progress
+      const { speedBps, etaSec } = this.speedCalc.update(currentBytes, fileMeta.size);
+      onProgress({
+        transferId: this.activeManifest.transferId,
+        fileId: fileMeta.id,
+        fileName: fileMeta.name,
+        fileIndex,
+        totalFiles: this.activeManifest.totalFiles,
+        bytesTransferred: currentBytes,
+        totalBytes: fileMeta.size,
+        percentage: Math.min(100, Math.round((currentBytes / fileMeta.size) * 100)),
+        speedBytesPerSec: speedBps,
+        timeRemainingSec: etaSec
+      });
+    }
+
+    // Check if all chunks for this file have arrived
+    if (chunksMap.size === header.totalChunks && !this.completedFileIds.has(fileMeta.id)) {
+      this.completedFileIds.add(fileMeta.id);
+
+      // Reconstruct chunks in sequential order
+      const orderedSlices: Uint8Array[] = [];
+      for (let i = 0; i < header.totalChunks; i++) {
+        const slice = chunksMap.get(i);
+        if (slice) orderedSlices.push(slice);
+      }
+
+      const blob = new Blob(orderedSlices as BlobPart[], { type: fileMeta.mimeType || 'application/octet-stream' });
+      const arrayBuffer = await blob.arrayBuffer();
+      const sha256 = await computeSha256(arrayBuffer);
+
+      return {
+        id: fileMeta.id,
+        name: fileMeta.name,
+        size: blob.size,
+        mimeType: fileMeta.mimeType,
+        sha256,
+        blob,
+        blobUrl: URL.createObjectURL(blob),
+        verified: true
+      };
+    }
+
+    return null;
+  }
+
+  isAllFilesReceived(): boolean {
+    if (!this.activeManifest) return false;
+    return this.completedFileIds.size === this.activeManifest.files.length;
+  }
+
   cancel(): void {
     this.isCancelled = true;
+    this.activeManifest = null;
+    this.fileChunks.clear();
+    this.fileReceivedBytes.clear();
   }
 }
-

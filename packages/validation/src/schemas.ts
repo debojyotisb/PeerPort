@@ -67,10 +67,12 @@ export const SignalingMessageTypeSchema = z.enum([
 
 export const SignalingMessageSchema = z.object({
   type: SignalingMessageTypeSchema,
-  roomId: z.string().min(3).max(32),
+  roomId: z.string().min(3).max(64),
   senderId: z.string().min(1).max(64),
   targetId: z.string().min(1).max(64).optional(),
   payload: z.unknown(),
   timestamp: z.number().int().positive()
 });
+
+export type SignalingMessage = z.infer<typeof SignalingMessageSchema>;
 

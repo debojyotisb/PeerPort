@@ -1,20 +1,18 @@
 import React from 'react';
-import { Radar, Globe, Wifi, Smartphone, ArrowRight } from 'lucide-react';
+import { Radar, Globe, Smartphone, ArrowRight, ShieldCheck, Info } from 'lucide-react';
 
 interface ActionCardsProps {
   onFindNearby: () => void;
   onShareWithBrowser: () => void;
-  onOfflineAndroidToIos: () => void;
 }
 
 export const ActionCards: React.FC<ActionCardsProps> = ({
   onFindNearby,
-  onShareWithBrowser,
-  onOfflineAndroidToIos
+  onShareWithBrowser
 }) => {
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full">
-      {/* Primary Action */}
+      {/* Primary Action: Find Nearby Devices */}
       <button
         onClick={onFindNearby}
         className="group relative p-6 rounded-2xl bg-gradient-to-b from-sky-500/10 to-sky-500/5 dark:from-sky-500/15 dark:to-transparent border border-sky-500/30 hover:border-sky-500/60 text-left transition-all hover:shadow-lg hover:shadow-sky-500/10 flex flex-col justify-between"
@@ -37,7 +35,7 @@ export const ActionCards: React.FC<ActionCardsProps> = ({
         </div>
       </button>
 
-      {/* Secondary Action */}
+      {/* Secondary Action: Share with a Browser */}
       <button
         onClick={onShareWithBrowser}
         className="group relative p-6 rounded-2xl bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700 text-left transition-all hover:shadow-md flex flex-col justify-between"
@@ -60,32 +58,25 @@ export const ActionCards: React.FC<ActionCardsProps> = ({
         </div>
       </button>
 
-      {/* Scenario A Highlight: Android to iPhone Offline Direct */}
-      <div className="md:col-span-2 p-4 rounded-xl bg-amber-500/5 dark:bg-amber-500/10 border border-amber-500/20 flex flex-col sm:flex-row items-center justify-between gap-3">
+      {/* Direct Browser Sharing Transparency Banner */}
+      <div className="md:col-span-2 p-4 rounded-xl bg-slate-100/80 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-lg bg-amber-500/20 text-amber-600 dark:text-amber-400 flex items-center justify-center shrink-0">
-            <Wifi className="w-5 h-5" />
+          <div className="w-9 h-9 rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-400 flex items-center justify-center shrink-0">
+            <ShieldCheck className="w-5 h-5 text-emerald-500" />
           </div>
           <div>
             <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-              <span>Android to iPhone (No Internet Required)</span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-600 dark:text-amber-400 font-bold uppercase tracking-wider">
-                Offline Mode
+              <span>Direct Browser-to-Browser Sharing</span>
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-bold uppercase tracking-wider">
+                Active
               </span>
             </h4>
             <p className="text-xs text-slate-600 dark:text-slate-400">
-              Transfer directly via Android Local Hotspot. iPhone connects by scanning QR with native camera—no app install required on iPhone.
+              iPhone, Android, Windows, Mac. The receiver scans the QR code with their normal camera—no app installation required. Payloads transfer directly peer-to-peer.
             </p>
           </div>
         </div>
-        <button
-          onClick={onOfflineAndroidToIos}
-          className="shrink-0 px-3.5 py-2 rounded-lg bg-amber-500 text-slate-950 text-xs font-bold hover:bg-amber-400 transition-colors shadow-sm"
-        >
-          Start Offline Transfer
-        </button>
       </div>
     </div>
   );
 };
-

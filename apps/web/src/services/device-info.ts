@@ -1,5 +1,17 @@
 import { DeviceInfo } from '@peerport/shared-types';
 
+export function generateSecureId(prefix = 'id'): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return `${prefix}_${crypto.randomUUID().replace(/-/g, '').substring(0, 12)}`;
+  }
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    return `${prefix}_${Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
+  }
+  return `${prefix}_${Date.now().toString(36)}`;
+}
+
 export function getLocalDeviceInfo(): DeviceInfo {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
   let platform: DeviceInfo['platform'] = 'browser';
@@ -25,7 +37,7 @@ export function getLocalDeviceInfo(): DeviceInfo {
   // Get or create unique ephemeral device ID
   let deviceId = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('peerport_device_id') : null;
   if (!deviceId) {
-    deviceId = `dev_${Math.random().toString(36).substring(2, 10)}`;
+    deviceId = generateSecureId('dev');
     if (typeof sessionStorage !== 'undefined') {
       sessionStorage.setItem('peerport_device_id', deviceId);
     }
