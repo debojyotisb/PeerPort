@@ -9,9 +9,22 @@ interface ApprovalDialogProps {
 }
 
 export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({ manifest, onApprove }) => {
+  const [isDeciding, setIsDeciding] = React.useState(false);
+
+  // Reset decision state whenever a new manifest arrives
+  React.useEffect(() => {
+    setIsDeciding(false);
+  }, [manifest?.transferId]);
+
   if (!manifest) return null;
 
   const isLargeTransfer = manifest.totalBytes > 1024 * 1024 * 1024; // > 1 GB warning
+
+  const handleDecision = (accepted: boolean) => {
+    if (isDeciding) return;
+    setIsDeciding(true);
+    onApprove(accepted);
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-sm animate-fade-in">
@@ -67,15 +80,17 @@ export const ApprovalDialog: React.FC<ApprovalDialogProps> = ({ manifest, onAppr
 
         <div className="flex items-center gap-3 pt-2">
           <button
-            onClick={() => onApprove(false)}
-            className="flex-1 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 font-semibold text-xs text-slate-700 dark:text-slate-300 transition-colors flex items-center justify-center gap-1.5"
+            disabled={isDeciding}
+            onClick={() => handleDecision(false)}
+            className="flex-1 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 font-semibold text-xs text-slate-700 dark:text-slate-300 transition-colors flex items-center justify-center gap-1.5"
           >
             <X className="w-4 h-4" />
             Decline
           </button>
           <button
-            onClick={() => onApprove(true)}
-            className="flex-1 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 font-bold text-xs text-slate-950 transition-colors flex items-center justify-center gap-1.5 shadow-md shadow-emerald-500/20"
+            disabled={isDeciding}
+            onClick={() => handleDecision(true)}
+            className="flex-1 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 font-bold text-xs text-slate-950 transition-colors flex items-center justify-center gap-1.5 shadow-md shadow-emerald-500/20"
           >
             <Check className="w-4 h-4" />
             Accept & Receive

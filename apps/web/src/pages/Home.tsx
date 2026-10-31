@@ -51,6 +51,7 @@ export const Home: React.FC = () => {
   const approveCallbackRef = useRef<((accepted: boolean) => Promise<void>) | null>(null);
   const activeManifestRef = useRef<TransferManifest | null>(null);
   const incomingManifestRef = useRef<TransferManifest | null>(null);
+  const activeTransferManifestRef = useRef<TransferManifest | null>(null);
   const sentHashesRef = useRef<Map<string, string>>(new Map());
   const ackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transportCleanupRef = useRef<(() => void) | null>(null);
@@ -121,7 +122,13 @@ export const Home: React.FC = () => {
     setConnectionState('CONNECTING');
 
     activeManifestRef.current = null;
+    activeTransferManifestRef.current = null;
     sentHashesRef.current.clear();
+
+    // Clean URL query if present so sender is never confused with a join session on re-render
+    if (typeof window !== 'undefined' && (window.location.search || window.location.hash)) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
 
     const webrtc = new WebRtcTransport();
     transportRef.current = webrtc;
@@ -150,6 +157,7 @@ export const Home: React.FC = () => {
     setConnectionState('CONNECTING');
 
     activeManifestRef.current = null;
+    activeTransferManifestRef.current = null;
     sentHashesRef.current.clear();
 
     const webrtc = new WebRtcTransport();
@@ -226,10 +234,12 @@ export const Home: React.FC = () => {
 
     unsubs.push(
       webrtc.subscribe('onTransferRequest', (manifest: TransferManifest, approveCallback: any) => {
-        approveCallbackRef.current = approveCallback;
-        setIncomingManifest(manifest);
-        incomingManifestRef.current = manifest;
-        setConnectionState('AWAITING_APPROVAL');
+        if (currentRole === 'RECEIVER') {
+          approveCallbackRef.current = approveCallback;
+          setIncomingManifest(manifest);
+          incomingManifestRef.current = manifest;
+          setConnectionState('AWAITING_APPROVAL');
+        }
       })
     );
 
@@ -291,6 +301,8 @@ export const Home: React.FC = () => {
     // Receiver: Handle real incoming chunks over WebRTC DataChannel
     unsubs.push(
       webrtc.subscribe('onChunkReceived', async (chunk: any) => {
+        if (currentRole !== 'RECEIVER') return;
+
         try {
           const completedFile = await transferEngine.handleIncomingChunk(chunk, (prog) => {
             setProgress(prog);
@@ -304,17 +316,17 @@ export const Home: React.FC = () => {
 
             if (transferEngine.isAllFilesReceived()) {
               // All files assembled and SHA-256 verified!
-              const currentIncoming = incomingManifestRef.current || transferEngine.getActiveManifest();
+              const currentActive = activeTransferManifestRef.current || transferEngine.getActiveManifest();
               const verifiedList = useTransferStore.getState().completedFiles.map((f) => ({
                 fileId: f.id,
                 sha256: f.sha256,
                 verified: f.verified
               }));
 
-              if (currentIncoming) {
+              if (currentActive) {
                 try {
                   await webrtc.sendTransferComplete(connectionRef.current || ({ id: 'sender' } as any), {
-                    transferId: currentIncoming.transferId,
+                    transferId: currentActive.transferId,
                     verified: true,
                     files: verifiedList
                   });
@@ -384,17 +396,57 @@ export const Home: React.FC = () => {
   };
 
   const handleApprovalResponse = async (accepted: boolean) => {
-    if (approveCallbackRef.current) {
-      await approveCallbackRef.current(accepted);
-    }
+    // 1. Capture the current manifest before clearing UI state
+    const manifest = incomingManifest || incomingManifestRef.current;
 
-    if (accepted && incomingManifest) {
-      transferEngine.prepareReceiver(incomingManifest);
-      setConnectionState('TRANSFERRING');
+    // Clear approveCallbackRef after capturing it so no stale callback persists
+    const approveCallback = approveCallbackRef.current;
+    approveCallbackRef.current = null;
+
+    // Clear incomingManifest and incomingManifestRef immediately so ApprovalDialog closes immediately
+    setIncomingManifest(null);
+    incomingManifestRef.current = null;
+
+    if (accepted && manifest) {
+      // 1. Prepare the receiver transfer engine SYNCHRONOUSLY before sending accept,
+      // preventing the first incoming chunk from being dropped on rapid transmission.
+      activeTransferManifestRef.current = manifest;
+      transferEngine.prepareReceiver(manifest);
+
+      // 3. If approval callback is missing, cancel engine, clear ref, and transition to FAILED
+      if (!approveCallback) {
+        activeTransferManifestRef.current = null;
+        transferEngine.cancel();
+        setConnectionState('FAILED', 'Approval callback missing. Could not notify sender.');
+        return;
+      }
+
+      // 2. Await the approval callback. Only transition the UI to TRANSFERRING after successful approval communication.
+      try {
+        await approveCallback(true);
+        setConnectionState('TRANSFERRING');
+      } catch (err: any) {
+        console.error('Failed to communicate acceptance to sender:', err);
+        // 3. If approval callback fails, cancel engine, clear ref, and transition to FAILED
+        activeTransferManifestRef.current = null;
+        transferEngine.cancel();
+        setConnectionState(
+          'FAILED',
+          'Could not send transfer approval to sender. Please check your connection and try again.'
+        );
+      }
     } else {
+      // 4. For rejection, clear active manifest, transition to REJECTED, and communicate rejection safely
+      activeTransferManifestRef.current = null;
       setConnectionState('REJECTED');
-      setIncomingManifest(null);
-      incomingManifestRef.current = null;
+
+      if (approveCallback) {
+        try {
+          await approveCallback(false);
+        } catch (err) {
+          console.warn('Failed to communicate decline to sender:', err);
+        }
+      }
     }
   };
 
@@ -403,6 +455,7 @@ export const Home: React.FC = () => {
       clearTimeout(ackTimeoutRef.current);
       ackTimeoutRef.current = null;
     }
+    activeTransferManifestRef.current = null;
     transferEngine.cancel();
     if (transportRef.current && connectionRef.current) {
       transportRef.current.cancelTransfer(connectionRef.current, 'current');
@@ -428,6 +481,7 @@ export const Home: React.FC = () => {
     approveCallbackRef.current = null;
     activeManifestRef.current = null;
     incomingManifestRef.current = null;
+    activeTransferManifestRef.current = null;
     sentHashesRef.current.clear();
     setIsQrModalOpen(false);
 

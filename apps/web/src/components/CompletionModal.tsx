@@ -21,9 +21,12 @@ export const CompletionModal: React.FC<CompletionModalProps> = ({
 
   if (!isOpen) return null;
 
+  // Strict, mutually exclusive role checks
   const isSender = role === 'SENDER';
+  const isReceiver = role === 'RECEIVER';
 
   const handleSaveAll = async () => {
+    if (!isReceiver) return;
     setIsSavingAll(true);
     for (const file of completedFiles) {
       if (file.blob) {
@@ -49,12 +52,18 @@ export const CompletionModal: React.FC<CompletionModalProps> = ({
         </div>
 
         <h3 className="text-xl font-bold text-slate-900 dark:text-white mb-1">
-          {isSender ? 'Sent Successfully!' : 'Files Received Successfully!'}
+          {isSender
+            ? 'Sent Successfully!'
+            : isReceiver
+            ? 'Files Received Successfully!'
+            : 'Transfer Completed!'}
         </h3>
         <p className="text-xs text-slate-500 dark:text-slate-400 mb-5">
           {isSender
             ? `${completedFiles.length} ${completedFiles.length === 1 ? 'file' : 'files'} delivered directly and verified by recipient.`
-            : `${completedFiles.length} ${completedFiles.length === 1 ? 'file' : 'files'} transferred directly over peer-to-peer connection.`}
+            : isReceiver
+            ? `${completedFiles.length} ${completedFiles.length === 1 ? 'file' : 'files'} transferred directly over peer-to-peer connection.`
+            : `${completedFiles.length} ${completedFiles.length === 1 ? 'file' : 'files'} transferred.`}
         </p>
 
         {/* Verification Status Badge */}
@@ -63,7 +72,9 @@ export const CompletionModal: React.FC<CompletionModalProps> = ({
           <span>
             {isSender
               ? 'Delivery & SHA-256 Checksum Verified by Receiver'
-              : 'SHA-256 Checksum Verified (100% Match)'}
+              : isReceiver
+              ? 'SHA-256 Checksum Verified (100% Match)'
+              : 'SHA-256 Checksum Verified'}
           </span>
         </div>
 
@@ -86,29 +97,27 @@ export const CompletionModal: React.FC<CompletionModalProps> = ({
                 </div>
               </div>
 
-              {/* Sender sees confirmation checkmark only; Receiver gets explicit Save button */}
-              {isSender ? (
+              {/* Save button ONLY when strictly RECEIVER with a valid blob */}
+              {isReceiver && file.blob ? (
+                <button
+                  onClick={() => triggerFileDownload(file.blob!, file.name)}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400 transition-colors shrink-0 flex items-center gap-1 shadow-sm"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Save
+                </button>
+              ) : isSender ? (
                 <div className="px-2.5 py-1 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-semibold flex items-center gap-1 shrink-0">
                   <Check className="w-3.5 h-3.5" />
                   <span>Delivered</span>
                 </div>
-              ) : (
-                file.blob && (
-                  <button
-                    onClick={() => triggerFileDownload(file.blob!, file.name)}
-                    className="px-3 py-1.5 rounded-lg bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400 transition-colors shrink-0 flex items-center gap-1 shadow-sm"
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                    Save
-                  </button>
-                )
-              )}
+              ) : null}
             </div>
           ))}
         </div>
 
         {/* Receiver-only: Save All action for multi-file transfers */}
-        {!isSender && completedFiles.length > 1 && (
+        {isReceiver && completedFiles.length > 1 && (
           <button
             onClick={handleSaveAll}
             disabled={isSavingAll}
@@ -129,10 +138,15 @@ export const CompletionModal: React.FC<CompletionModalProps> = ({
               <Check className="w-3.5 h-3.5" />
               Done
             </>
-          ) : (
+          ) : isReceiver ? (
             <>
               <RefreshCw className="w-3.5 h-3.5" />
               Start New Transfer
+            </>
+          ) : (
+            <>
+              <Check className="w-3.5 h-3.5" />
+              Close
             </>
           )}
         </button>
