@@ -44,7 +44,12 @@ export interface WebRtcSignalPayload {
 
 export interface TransferCompletePayload {
   transferId: string;
-  fileId: string;
-  sha256: string;
+  fileId?: string;
+  sha256?: string;
   verified: boolean;
+  files?: Array<{
+    fileId: string;
+    sha256: string;
+    verified: boolean;
+  }>;
 }

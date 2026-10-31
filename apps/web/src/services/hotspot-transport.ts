@@ -7,7 +7,8 @@ import {
   TransferManifest,
   TransferResponse,
   BinaryChunk,
-  TransferProgress
+  TransferProgress,
+  TransferCompletePayload
 } from '@peerport/shared-types';
 
 export interface HotspotSessionDetails {
@@ -35,7 +36,7 @@ export class HotspotTransport implements PeerTransport {
     onTransferRequest: new Set<(manifest: TransferManifest, approve: (accepted: boolean) => Promise<void>) => void>(),
     onTransferResponse: new Set<(response: TransferResponse) => void>(),
     onProgress: new Set<(progress: TransferProgress) => void>(),
-    onTransferComplete: new Set<(fileId: string, sha256: string) => void>(),
+    onTransferComplete: new Set<(payload: TransferCompletePayload) => void>(),
     onError: new Set<(error: Error) => void>()
   };
 

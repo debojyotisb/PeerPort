@@ -151,7 +151,12 @@ export class TransferEngine {
 
     // Validate transferId matches current active transfer
     const manifestPrefix = this.activeManifest.transferId.slice(0, 16);
-    if (!header.transferId.startsWith(manifestPrefix) && !manifestPrefix.startsWith(header.transferId)) {
+    if (header.transferId !== this.activeManifest.transferId && !header.transferId.startsWith(manifestPrefix) && !manifestPrefix.startsWith(header.transferId)) {
+      return null;
+    }
+
+    // Validate chunk bounds
+    if (header.chunkIndex < 0 || header.chunkIndex >= header.totalChunks) {
       return null;
     }
 
@@ -193,18 +198,36 @@ export class TransferEngine {
 
     // Check if all chunks for this file have arrived
     if (chunksMap.size === header.totalChunks && !this.completedFileIds.has(fileMeta.id)) {
-      this.completedFileIds.add(fileMeta.id);
-
       // Reconstruct chunks in sequential order
       const orderedSlices: Uint8Array[] = [];
       for (let i = 0; i < header.totalChunks; i++) {
         const slice = chunksMap.get(i);
-        if (slice) orderedSlices.push(slice);
+        if (!slice) {
+          console.error(`Missing chunk index ${i} of ${header.totalChunks} for file ${fileMeta.name}`);
+          return null;
+        }
+        orderedSlices.push(slice);
       }
 
       const blob = new Blob(orderedSlices as BlobPart[], { type: fileMeta.mimeType || 'application/octet-stream' });
+
+      // Verify complete file size matches manifest
+      if (blob.size !== fileMeta.size) {
+        console.error(`File size mismatch for ${fileMeta.name}: expected ${fileMeta.size}, got ${blob.size}`);
+        return null;
+      }
+
       const arrayBuffer = await blob.arrayBuffer();
       const sha256 = await computeSha256(arrayBuffer);
+
+      // If manifest specified a sha256 checksum, verify 100% match
+      if (fileMeta.sha256 && fileMeta.sha256.toLowerCase() !== sha256.toLowerCase()) {
+        console.error(`SHA-256 mismatch for ${fileMeta.name}: expected ${fileMeta.sha256}, got ${sha256}`);
+        return null;
+      }
+
+      // Mark file as completed only after successful assembly and verification
+      this.completedFileIds.add(fileMeta.id);
 
       return {
         id: fileMeta.id,
@@ -219,6 +242,10 @@ export class TransferEngine {
     }
 
     return null;
+  }
+
+  getActiveManifest(): TransferManifest | null {
+    return this.activeManifest;
   }
 
   isAllFilesReceived(): boolean {

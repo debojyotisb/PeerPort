@@ -104,4 +104,93 @@ describe('Real File Transfer Engine Loop', () => {
     const res = await engine.handleIncomingChunk(rogueChunk, () => {});
     expect(res).toBeNull();
   });
+
+  it('rejects file completion if reconstructed size does not match manifest', async () => {
+    const engine = new TransferEngine();
+    const payload = new Uint8Array(1024);
+    const file = new File([payload], 'doc.pdf', { type: 'application/pdf' });
+    const manifest = engine.createManifest([file]);
+
+    // Intentionally mutate manifest expected size to simulate corrupted/truncated expectation
+    manifest.files[0].size = 2048;
+
+    engine.prepareReceiver(manifest);
+
+    const chunk: any = {
+      header: {
+        magic: 0x50505254,
+        version: 1,
+        messageType: 1,
+        transferId: manifest.transferId,
+        fileId: manifest.files[0].id,
+        chunkIndex: 0,
+        totalChunks: 1,
+        payloadLength: 1024
+      },
+      data: payload
+    };
+
+    const res = await engine.handleIncomingChunk(chunk, () => {});
+    expect(res).toBeNull();
+    expect(engine.isAllFilesReceived()).toBe(false);
+  });
+
+  it('rejects file completion if SHA-256 hash mismatch occurs', async () => {
+    const engine = new TransferEngine();
+    const payload = new Uint8Array([1, 2, 3, 4, 5]);
+    const file = new File([payload], 'secure.dat', { type: 'application/octet-stream' });
+    const manifest = engine.createManifest([file]);
+
+    // Provide incorrect expected hash
+    manifest.files[0].sha256 = '0000000000000000000000000000000000000000000000000000000000000000';
+
+    engine.prepareReceiver(manifest);
+
+    const chunk: any = {
+      header: {
+        magic: 0x50505254,
+        version: 1,
+        messageType: 1,
+        transferId: manifest.transferId,
+        fileId: manifest.files[0].id,
+        chunkIndex: 0,
+        totalChunks: 1,
+        payloadLength: payload.length
+      },
+      data: payload
+    };
+
+    const res = await engine.handleIncomingChunk(chunk, () => {});
+    expect(res).toBeNull();
+    expect(engine.isAllFilesReceived()).toBe(false);
+  });
+
+  it('does not mark transfer completed if any file in a multi-file batch is incomplete', async () => {
+    const engine = new TransferEngine();
+    const file1 = new File([new Uint8Array(100)], 'f1.txt', { type: 'text/plain' });
+    const file2 = new File([new Uint8Array(200)], 'f2.txt', { type: 'text/plain' });
+    const manifest = engine.createManifest([file1, file2]);
+
+    engine.prepareReceiver(manifest);
+
+    // Deliver only file 1
+    const chunk1: any = {
+      header: {
+        magic: 0x50505254,
+        version: 1,
+        messageType: 1,
+        transferId: manifest.transferId,
+        fileId: manifest.files[0].id,
+        chunkIndex: 0,
+        totalChunks: 1,
+        payloadLength: 100
+      },
+      data: new Uint8Array(100)
+    };
+
+    const res1 = await engine.handleIncomingChunk(chunk1, () => {});
+    expect(res1).not.toBeNull();
+    // Entire transfer is NOT completed because file 2 is still pending
+    expect(engine.isAllFilesReceived()).toBe(false);
+  });
 });

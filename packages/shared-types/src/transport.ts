@@ -1,5 +1,6 @@
 import { ConnectionState, TransportMode, DeviceInfo } from './state.js';
 import { TransferManifest, TransferResponse, BinaryChunk, TransferProgress } from './transfer.js';
+import { TransferCompletePayload } from './signaling.js';
 
 export interface DiscoveredPeer {
   id: string;
@@ -24,7 +25,7 @@ export interface PeerTransportEvents {
   onTransferRequest: (manifest: TransferManifest, approve: (accepted: boolean) => Promise<void>) => void;
   onTransferResponse: (response: TransferResponse) => void;
   onProgress: (progress: TransferProgress) => void;
-  onTransferComplete: (fileId: string, sha256: string) => void;
+  onTransferComplete: (payload: TransferCompletePayload) => void;
   onError: (error: Error) => void;
 }
 
@@ -40,6 +41,7 @@ export interface PeerTransport {
   respondTransferRequest(connection: PeerConnection, transferId: string, accepted: boolean): Promise<void>;
   sendChunk(connection: PeerConnection, chunk: BinaryChunk): Promise<void>;
   cancelTransfer(connection: PeerConnection, transferId: string): Promise<void>;
+  sendTransferComplete?(connection: PeerConnection, payload: TransferCompletePayload): Promise<void>;
   closeConnection(connection: PeerConnection): Promise<void>;
   
   subscribe<K extends keyof PeerTransportEvents>(event: K, handler: PeerTransportEvents[K]): () => void;

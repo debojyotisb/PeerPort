@@ -59,10 +59,23 @@ export const useTransferStore = create<TransferStoreState>((set) => ({
   setProgress: (progress) => set({ progress }),
   setVerifyingIntegrity: (isVerifyingIntegrity) => set({ isVerifyingIntegrity }),
   addCompletedFile: (file) =>
-    set((state) => ({
-      completedFiles: [...state.completedFiles, file]
-    })),
-  resetTransfer: () =>
+    set((state) => {
+      // Deduplicate by stable unique file ID within the transfer
+      if (state.completedFiles.some((f) => f.id === file.id)) {
+        return state;
+      }
+      return { completedFiles: [...state.completedFiles, file] };
+    }),
+  resetTransfer: () => {
+    // Safely revoke object URLs upon explicit reset
+    const current = useTransferStore.getState().completedFiles;
+    for (const f of current) {
+      if (f.blobUrl) {
+        try {
+          URL.revokeObjectURL(f.blobUrl);
+        } catch {}
+      }
+    }
     set({
       selectedFiles: [],
       outgoingManifest: null,
@@ -70,6 +83,7 @@ export const useTransferStore = create<TransferStoreState>((set) => ({
       progress: null,
       completedFiles: [],
       isVerifyingIntegrity: false
-    })
+    });
+  }
 }));
 

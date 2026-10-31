@@ -12,15 +12,13 @@ import { useTransferStore } from '../state/transfer-store.js';
 import { WebRtcTransport } from '../services/webrtc-transport.js';
 import { TransferEngine } from '../services/transfer-engine.js';
 import { generateSecureId } from '../services/device-info.js';
-import { triggerFileDownload } from '../services/file-selection.js';
-import { PeerConnection } from '@peerport/shared-types';
-import { Loader2, UserCheck, AlertCircle, RefreshCw } from 'lucide-react';
+import { PeerConnection, TransferManifest, TransferCompletePayload } from '@peerport/shared-types';
+import { Loader2, AlertCircle, RefreshCw } from 'lucide-react';
 
 export const Home: React.FC = () => {
   const {
     connectionState,
     role,
-    roomId,
     remoteDevice,
     errorMessage,
     setConnectionState,
@@ -36,6 +34,7 @@ export const Home: React.FC = () => {
     incomingManifest,
     progress,
     completedFiles,
+    setOutgoingManifest,
     setIncomingManifest,
     setProgress,
     addCompletedFile,
@@ -45,9 +44,35 @@ export const Home: React.FC = () => {
   const [isQrModalOpen, setIsQrModalOpen] = useState(false);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [transferEngine] = useState(() => new TransferEngine());
+
+  // Stable references across component renders and transfer lifecycles
   const transportRef = useRef<WebRtcTransport | null>(null);
   const connectionRef = useRef<PeerConnection | null>(null);
   const approveCallbackRef = useRef<((accepted: boolean) => Promise<void>) | null>(null);
+  const activeManifestRef = useRef<TransferManifest | null>(null);
+  const incomingManifestRef = useRef<TransferManifest | null>(null);
+  const sentHashesRef = useRef<Map<string, string>>(new Map());
+  const ackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const transportCleanupRef = useRef<(() => void) | null>(null);
+
+  // Sync incomingManifest ref
+  useEffect(() => {
+    incomingManifestRef.current = incomingManifest;
+  }, [incomingManifest]);
+
+  // Cleanup on component unmount
+  useEffect(() => {
+    return () => {
+      if (ackTimeoutRef.current) {
+        clearTimeout(ackTimeoutRef.current);
+        ackTimeoutRef.current = null;
+      }
+      transportCleanupRef.current?.();
+      transportCleanupRef.current = null;
+      transportRef.current?.close();
+      transportRef.current = null;
+    };
+  }, []);
 
   // Check URL parameters for direct session joining (supports ?join=ID, /join/ID, or #join=ID)
   useEffect(() => {
@@ -84,15 +109,23 @@ export const Home: React.FC = () => {
       return;
     }
 
+    // Clean up previous transport session if any
+    transportCleanupRef.current?.();
+    transportCleanupRef.current = null;
+    transportRef.current?.close();
+
     const sessionId = generateSecureId('ses');
     setRoomId(sessionId);
     setRole('SENDER');
     setMode('WEBRTC_P2P');
     setConnectionState('CONNECTING');
 
+    activeManifestRef.current = null;
+    sentHashesRef.current.clear();
+
     const webrtc = new WebRtcTransport();
     transportRef.current = webrtc;
-    setupTransportListeners(webrtc, 'SENDER');
+    transportCleanupRef.current = setupTransportListeners(webrtc, 'SENDER');
 
     try {
       await webrtc.joinRoom(sessionId);
@@ -106,14 +139,22 @@ export const Home: React.FC = () => {
   const handleJoinSession = async (sessionId: string) => {
     if (!sessionId) return;
 
+    // Clean up previous transport session if any
+    transportCleanupRef.current?.();
+    transportCleanupRef.current = null;
+    transportRef.current?.close();
+
     setRoomId(sessionId);
     setRole('RECEIVER');
     setMode('WEBRTC_P2P');
     setConnectionState('CONNECTING');
 
+    activeManifestRef.current = null;
+    sentHashesRef.current.clear();
+
     const webrtc = new WebRtcTransport();
     transportRef.current = webrtc;
-    setupTransportListeners(webrtc, 'RECEIVER');
+    transportCleanupRef.current = setupTransportListeners(webrtc, 'RECEIVER');
 
     try {
       await webrtc.joinRoom(sessionId);
@@ -124,121 +165,222 @@ export const Home: React.FC = () => {
     }
   };
 
-  const setupTransportListeners = (webrtc: WebRtcTransport, currentRole: 'SENDER' | 'RECEIVER') => {
-    webrtc.subscribe('onConnectionStateChange', (state: any, reason?: any) => {
-      setConnectionState(state, reason);
-    });
+  const setupTransportListeners = (webrtc: WebRtcTransport, currentRole: 'SENDER' | 'RECEIVER'): (() => void) => {
+    const unsubs: (() => void)[] = [];
 
-    webrtc.subscribe('onPeerFound', async (peer: any) => {
-      setRemoteDevice(peer.device);
+    unsubs.push(
+      webrtc.subscribe('onConnectionStateChange', (state: any, reason?: any) => {
+        setConnectionState(state, reason);
+      })
+    );
 
-      // As the sender, when the receiver joins the room, initiate WebRTC peer connection
-      if (currentRole === 'SENDER') {
-        try {
-          const conn = await webrtc.connect(peer.id);
-          connectionRef.current = conn;
-        } catch (err: any) {
-          console.error('WebRTC connect error:', err);
-          setConnectionState('FAILED', 'Failed to negotiate direct peer connection');
-        }
-      }
-    });
+    unsubs.push(
+      webrtc.subscribe('onPeerFound', async (peer: any) => {
+        setRemoteDevice(peer.device);
 
-    webrtc.subscribe('onPeerLost', () => {
-      setRemoteDevice(null);
-      if (connectionState === 'TRANSFERRING' || connectionState === 'AWAITING_APPROVAL') {
-        setConnectionState('DISCONNECTED', 'Remote device disconnected');
-      }
-    });
-
-    webrtc.subscribe('onChannelReady', async () => {
-      // DataChannel is open! If we are the sender with selected files, dispatch transfer manifest
-      if (currentRole === 'SENDER' && selectedFiles.length > 0) {
-        setIsQrModalOpen(false);
-        const manifest = transferEngine.createManifest(selectedFiles);
-        try {
-          await webrtc.sendTransferRequest(connectionRef.current || ({ id: 'receiver' } as any), manifest);
-          setConnectionState('AWAITING_APPROVAL');
-        } catch (err: any) {
-          console.error('Failed to send transfer manifest:', err);
-        }
-      }
-    });
-
-    webrtc.subscribe('onTransferRequest', (manifest: any, approveCallback: any) => {
-      approveCallbackRef.current = approveCallback;
-      setIncomingManifest(manifest);
-      setConnectionState('AWAITING_APPROVAL');
-    });
-
-    webrtc.subscribe('onTransferResponse', async (response: any) => {
-      if (response.accepted) {
-        setConnectionState('TRANSFERRING');
-        setIsQrModalOpen(false);
-
-        // Sender: Start streaming real file chunks with backpressure
-        if (currentRole === 'SENDER' && selectedFiles.length > 0) {
-          const manifest = transferEngine.createManifest(selectedFiles);
+        // Sender initiates WebRTC connection when receiver joins room
+        if (currentRole === 'SENDER') {
           try {
-            for (let i = 0; i < selectedFiles.length; i++) {
-              const file = selectedFiles[i];
-              const sha256 = await transferEngine.sendFile(
-                webrtc,
-                connectionRef.current || ({ id: 'receiver' } as any),
-                file,
-                manifest,
-                i,
-                (prog) => setProgress(prog)
-              );
-
-              addCompletedFile({
-                id: file.name,
-                name: file.name,
-                size: file.size,
-                mimeType: file.type || 'application/octet-stream',
-                sha256,
-                blob: file,
-                blobUrl: URL.createObjectURL(file),
-                verified: true
-              });
-            }
-            setConnectionState('COMPLETED');
+            const conn = await webrtc.connect(peer.id);
+            connectionRef.current = conn;
           } catch (err: any) {
-            console.error('Transfer stream error:', err);
-            setConnectionState('FAILED', err.message || 'File transfer was interrupted');
+            console.error('WebRTC connect error:', err);
+            setConnectionState('FAILED', 'Failed to negotiate direct peer connection');
           }
         }
-      } else {
-        setConnectionState('REJECTED', response.reason || 'Receiver declined the transfer request');
-      }
-    });
+      })
+    );
+
+    unsubs.push(
+      webrtc.subscribe('onPeerLost', () => {
+        setRemoteDevice(null);
+        if (connectionState === 'TRANSFERRING' || connectionState === 'AWAITING_APPROVAL') {
+          setConnectionState('DISCONNECTED', 'Remote device disconnected');
+        }
+      })
+    );
+
+    unsubs.push(
+      webrtc.subscribe('onChannelReady', async () => {
+        // DataChannel is open! Sender dispatches transfer manifest
+        if (currentRole === 'SENDER' && selectedFiles.length > 0) {
+          setIsQrModalOpen(false);
+
+          // Generate manifest EXACTLY ONCE for this transfer session
+          let manifest = activeManifestRef.current;
+          if (!manifest) {
+            manifest = transferEngine.createManifest(selectedFiles);
+            activeManifestRef.current = manifest;
+            setOutgoingManifest(manifest);
+          }
+
+          try {
+            await webrtc.sendTransferRequest(connectionRef.current || ({ id: 'receiver' } as any), manifest);
+            setConnectionState('AWAITING_APPROVAL');
+          } catch (err: any) {
+            console.error('Failed to send transfer manifest:', err);
+          }
+        }
+      })
+    );
+
+    unsubs.push(
+      webrtc.subscribe('onTransferRequest', (manifest: TransferManifest, approveCallback: any) => {
+        approveCallbackRef.current = approveCallback;
+        setIncomingManifest(manifest);
+        incomingManifestRef.current = manifest;
+        setConnectionState('AWAITING_APPROVAL');
+      })
+    );
+
+    unsubs.push(
+      webrtc.subscribe('onTransferResponse', async (response: any) => {
+        if (response.accepted) {
+          setConnectionState('TRANSFERRING');
+          setIsQrModalOpen(false);
+
+          // Sender: stream chunks using the STABLE manifest instance created earlier
+          if (currentRole === 'SENDER' && selectedFiles.length > 0) {
+            const manifest = activeManifestRef.current;
+            if (!manifest) {
+              console.error('Active outgoing manifest missing during send');
+              setConnectionState('FAILED', 'Transfer manifest missing');
+              return;
+            }
+
+            try {
+              sentHashesRef.current.clear();
+
+              for (let i = 0; i < selectedFiles.length; i++) {
+                const file = selectedFiles[i];
+                const sha256 = await transferEngine.sendFile(
+                  webrtc,
+                  connectionRef.current || ({ id: 'receiver' } as any),
+                  file,
+                  manifest,
+                  i,
+                  (prog) => setProgress(prog)
+                );
+
+                const fileId = manifest.files[i]?.id || `file_${i}`;
+                sentHashesRef.current.set(fileId, sha256);
+              }
+
+              // All chunks transmitted: Sender enters waiting state for receiver acknowledgement
+              // Set a 30-second timeout so sender doesn't wait indefinitely if receiver crashes
+              if (ackTimeoutRef.current) clearTimeout(ackTimeoutRef.current);
+              ackTimeoutRef.current = setTimeout(() => {
+                if (useConnectionStore.getState().connectionState === 'TRANSFERRING') {
+                  setConnectionState(
+                    'FAILED',
+                    'Delivery acknowledgement timed out: receiver did not confirm file receipt.'
+                  );
+                }
+              }, 30_000);
+            } catch (err: any) {
+              console.error('Transfer stream error:', err);
+              setConnectionState('FAILED', err.message || 'File transfer was interrupted');
+            }
+          }
+        } else {
+          setConnectionState('REJECTED', response.reason || 'Receiver declined the transfer request');
+        }
+      })
+    );
 
     // Receiver: Handle real incoming chunks over WebRTC DataChannel
-    webrtc.subscribe('onChunkReceived', async (chunk: any) => {
-      try {
-        const completedFile = await transferEngine.handleIncomingChunk(chunk, (prog) => {
-          setProgress(prog);
-        });
+    unsubs.push(
+      webrtc.subscribe('onChunkReceived', async (chunk: any) => {
+        try {
+          const completedFile = await transferEngine.handleIncomingChunk(chunk, (prog) => {
+            setProgress(prog);
+          });
 
-        if (completedFile) {
-          addCompletedFile(completedFile);
-          // Automatically trigger native browser download
-          if (completedFile.blob) {
-            triggerFileDownload(completedFile.blob, completedFile.name);
-          }
+          if (completedFile) {
+            // Deduplicated insertion into store by stable file ID
+            addCompletedFile(completedFile);
 
-          if (transferEngine.isAllFilesReceived()) {
-            setConnectionState('COMPLETED');
+            // NO automatic triggerFileDownload: user must explicitly click "Save"
+
+            if (transferEngine.isAllFilesReceived()) {
+              // All files assembled and SHA-256 verified!
+              const currentIncoming = incomingManifestRef.current || transferEngine.getActiveManifest();
+              const verifiedList = useTransferStore.getState().completedFiles.map((f) => ({
+                fileId: f.id,
+                sha256: f.sha256,
+                verified: f.verified
+              }));
+
+              if (currentIncoming) {
+                try {
+                  await webrtc.sendTransferComplete(connectionRef.current || ({ id: 'sender' } as any), {
+                    transferId: currentIncoming.transferId,
+                    verified: true,
+                    files: verifiedList
+                  });
+                } catch (ackErr) {
+                  console.warn('Failed to send completion acknowledgement to sender:', ackErr);
+                }
+              }
+
+              setConnectionState('COMPLETED');
+            }
           }
+        } catch (err: any) {
+          console.error('Error handling chunk on receiver:', err);
         }
-      } catch (err: any) {
-        console.error('Error handling chunk on receiver:', err);
-      }
-    });
+      })
+    );
 
-    webrtc.subscribe('onError', (err: any) => {
-      setConnectionState('FAILED', err.message);
-    });
+    // Sender: Receive TRANSFER_COMPLETE acknowledgement from receiver
+    unsubs.push(
+      webrtc.subscribe('onTransferComplete', (payload: TransferCompletePayload) => {
+        if (currentRole === 'SENDER') {
+          if (ackTimeoutRef.current) {
+            clearTimeout(ackTimeoutRef.current);
+            ackTimeoutRef.current = null;
+          }
+
+          const manifest = activeManifestRef.current;
+          if (!manifest || payload.transferId !== manifest.transferId) {
+            console.warn('Received TRANSFER_COMPLETE for mismatched transfer ID:', payload.transferId);
+            return;
+          }
+
+          if (!payload.verified) {
+            setConnectionState('FAILED', 'Receiver reported integrity checksum verification failure.');
+            return;
+          }
+
+          // Receiver verified successfully! Populate completed files on sender for delivery summary
+          for (let i = 0; i < selectedFiles.length; i++) {
+            const file = selectedFiles[i];
+            const fileMeta = manifest.files[i];
+            const fileId = fileMeta?.id || `file_${i}`;
+            addCompletedFile({
+              id: fileId,
+              name: file.name,
+              size: file.size,
+              mimeType: file.type || 'application/octet-stream',
+              sha256: sentHashesRef.current.get(fileId) || '',
+              verified: true
+            });
+          }
+
+          setConnectionState('COMPLETED');
+        }
+      })
+    );
+
+    unsubs.push(
+      webrtc.subscribe('onError', (err: any) => {
+        setConnectionState('FAILED', err.message);
+      })
+    );
+
+    return () => {
+      unsubs.forEach((unsub) => unsub());
+    };
   };
 
   const handleApprovalResponse = async (accepted: boolean) => {
@@ -252,10 +394,15 @@ export const Home: React.FC = () => {
     } else {
       setConnectionState('REJECTED');
       setIncomingManifest(null);
+      incomingManifestRef.current = null;
     }
   };
 
   const handleCancelTransfer = () => {
+    if (ackTimeoutRef.current) {
+      clearTimeout(ackTimeoutRef.current);
+      ackTimeoutRef.current = null;
+    }
     transferEngine.cancel();
     if (transportRef.current && connectionRef.current) {
       transportRef.current.cancelTransfer(connectionRef.current, 'current');
@@ -264,16 +411,38 @@ export const Home: React.FC = () => {
   };
 
   const handleResetAll = () => {
-    resetConnection();
-    resetTransfer();
-    transferEngine.cancel();
+    if (ackTimeoutRef.current) {
+      clearTimeout(ackTimeoutRef.current);
+      ackTimeoutRef.current = null;
+    }
+
+    transportCleanupRef.current?.();
+    transportCleanupRef.current = null;
+
     if (transportRef.current) {
       transportRef.current.close();
       transportRef.current = null;
     }
+
     connectionRef.current = null;
     approveCallbackRef.current = null;
+    activeManifestRef.current = null;
+    incomingManifestRef.current = null;
+    sentHashesRef.current.clear();
     setIsQrModalOpen(false);
+
+    // Revoke any blob URLs safely before store reset
+    completedFiles.forEach((f) => {
+      if (f.blobUrl) {
+        try {
+          URL.revokeObjectURL(f.blobUrl);
+        } catch {}
+      }
+    });
+
+    resetConnection();
+    resetTransfer();
+    transferEngine.cancel();
 
     // Clean URL query if in join mode
     if (typeof window !== 'undefined' && (window.location.search || window.location.hash)) {
@@ -383,6 +552,7 @@ export const Home: React.FC = () => {
       {/* Transfer Completion & Verification Modal */}
       <CompletionModal
         isOpen={connectionState === 'COMPLETED'}
+        role={role}
         completedFiles={completedFiles}
         onReset={handleResetAll}
       />

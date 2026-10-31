@@ -8,6 +8,7 @@ import {
   TransferResponse,
   BinaryChunk,
   TransferProgress,
+  TransferCompletePayload,
   SignalingMessage
 } from '@peerport/shared-types';
 import { encodeChunk, decodeChunk, ChunkMessageType, DEFAULT_FLOW_CONFIG } from '@peerport/transfer-protocol';
@@ -33,7 +34,7 @@ export class WebRtcTransport implements PeerTransport {
     onTransferRequest: new Set<(manifest: TransferManifest, approve: (accepted: boolean) => Promise<void>) => void>(),
     onTransferResponse: new Set<(response: TransferResponse) => void>(),
     onProgress: new Set<(progress: TransferProgress) => void>(),
-    onTransferComplete: new Set<(fileId: string, sha256: string) => void>(),
+    onTransferComplete: new Set<(payload: TransferCompletePayload) => void>(),
     onError: new Set<(error: Error) => void>(),
     onChunkReceived: new Set<(chunk: BinaryChunk) => void>(),
     onChannelReady: new Set<() => void>()
@@ -239,6 +240,24 @@ export class WebRtcTransport implements PeerTransport {
       timestamp: Date.now()
     });
     this.updateState('CANCELLED');
+  }
+
+  async sendTransferComplete(connection: PeerConnection, payload: TransferCompletePayload): Promise<void> {
+    const localDevice = getLocalDeviceInfo();
+    this.sendSignal({
+      type: 'TRANSFER_COMPLETE',
+      roomId: this.currentRoomId || 'default',
+      senderId: localDevice.deviceId,
+      targetId: this.targetPeerId || connection.id,
+      payload,
+      timestamp: Date.now()
+    });
+  }
+
+  clearListeners(): void {
+    for (const key of Object.keys(this.listeners) as (keyof typeof this.listeners)[]) {
+      this.listeners[key].clear();
+    }
   }
 
   async closeConnection(connection: PeerConnection): Promise<void> {
@@ -499,6 +518,14 @@ export class WebRtcTransport implements PeerTransport {
 
       case 'TRANSFER_CANCEL': {
         this.updateState('CANCELLED');
+        break;
+      }
+
+      case 'TRANSFER_COMPLETE': {
+        const payload = msg.payload as TransferCompletePayload;
+        for (const l of this.listeners.onTransferComplete) {
+          l(payload);
+        }
         break;
       }
 
