@@ -252,13 +252,20 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
       transport.subscribe('onConnectionStateChange', (state: any, reason?: string) => {
         console.log(`[DIAG STATE] [${new Date().toISOString()}] AirGappedModal received onConnectionStateChange -> ${state} (current phase: ${phase}, reason: ${reason || 'none'})`);
         if (state === 'FAILED') {
-          // Do not transition to FAILED while actively waiting for peer to scan QR code
+          // If the transport reports an explicit terminal failure or timeout, transition to FAILED
+          const isTimeoutOrTerminal =
+            reason?.includes('timed out') ||
+            reason?.includes('timeout') ||
+            reason?.includes('WebRTC Network Offline') ||
+            reason?.includes('Direct peer-to-peer network link failed');
+
           if (
-            phase === 'WAITING_FOR_SENDER' ||
-            phase === 'WAITING_FOR_RECEIVER' ||
-            phase === 'GENERATING_ANSWER' ||
-            phase === 'CREATING_OFFER' ||
-            phase === 'GENERATING_QR'
+            !isTimeoutOrTerminal &&
+            (phase === 'WAITING_FOR_SENDER' ||
+              phase === 'WAITING_FOR_RECEIVER' ||
+              phase === 'GENERATING_ANSWER' ||
+              phase === 'CREATING_OFFER' ||
+              phase === 'GENERATING_QR')
           ) {
             console.warn(
               `[DIAG WARN] [${new Date().toISOString()}] Suppressing premature FAILED transition while in phase: ${phase}. Handshake in progress.`
@@ -917,20 +924,23 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
                 <HelpCircle className="w-4 h-4 text-sky-500 shrink-0" />
                 <span>Actionable Diagnostic Remedies:</span>
               </div>
-              {errorMessage?.includes('Firefox') || errorMessage?.includes('Network Interface Offline') ? (
+              {errorMessage?.includes('Network Offline') || errorMessage?.includes('hotspot') || errorMessage?.includes('network link') ? (
                 <>
                   <p className="text-amber-700 dark:text-amber-300 font-medium">
-                    • <strong>Local Network Link:</strong> WebRTC requires an active local Wi-Fi or phone hotspot link. Ensure Wi-Fi is enabled on both devices and connected to the same hotspot or Wi-Fi.
+                    • <strong>Local Network Link:</strong> Direct transfer requires both devices to be connected to the same Wi-Fi network or mobile hotspot.
                   </p>
                   <p className="text-slate-700 dark:text-slate-300">
-                    • <strong>Firefox Work Offline Restriction:</strong> In Firefox, when Windows reports "No Internet", Firefox blocks WebRTC. On laptop, open <code>about:config</code> and set <code>network.manage-offline-status</code> to <code>false</code>, or open PeerPort in <strong>Chrome / Edge</strong> which natively supports local hotspot transfers without internet.
+                    • <strong>Offline Hotspot:</strong> Turning mobile data OFF on your phone hotspot is fully supported. Keep Wi-Fi active on both devices.
+                  </p>
+                  <p className="text-slate-700 dark:text-slate-300">
+                    • <strong>Client Isolation:</strong> Some public or guest Wi-Fi networks block device-to-device communication. Use a mobile hotspot if direct connection fails.
                   </p>
                 </>
               ) : (
                 <>
                   <p>• Ensure both devices are connected to the same Wi-Fi network or mobile hotspot.</p>
-                  <p>• Turning mobile data OFF on the hotspot phone does not affect Wi-Fi. Keep Wi-Fi active.</p>
-                  <p>• If using multi-frame QR codes, ensure all frames are scanned by the receiver camera.</p>
+                  <p>• Turning mobile data OFF on the hotspot phone does not affect local Wi-Fi. Keep Wi-Fi active.</p>
+                  <p>• Ensure both Offer and Answer QR codes are scanned completely.</p>
                   <p>• Test your camera and scanner independently using the <strong>Test Scanner</strong> button in the header.</p>
                 </>
               )}
