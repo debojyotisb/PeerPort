@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import QRCode from 'qrcode';
 import jsQR from 'jsqr';
 import {
@@ -27,8 +27,11 @@ import {
 import { AirGappedTransport } from '../services/air-gapped-transport.js';
 import {
   QrSignalingPacket,
+  CompactSdpPacket,
+  AnyQrPacket,
   QrPayloadReassembler,
-  parseAndValidateQrPayload
+  parseAndValidateQrPayload,
+  isCompactSdpPacket
 } from '../services/qr-signaling.js';
 import { generateSecureId } from '../services/device-info.js';
 
@@ -51,6 +54,7 @@ export interface ScannerDiagnostics {
   decoderInit: string;
   scanAttempts: number;
   qrDetected: boolean;
+  qrDetectionState: 'Searching' | 'Pattern Found' | 'Decoded (Valid Packet)' | 'Decoded (Invalid JSON)' | 'Decoded (Non-PeerPort)';
   qrDetectedLength: number;
   decoderUsed: string;
   jsonParsed: boolean;
@@ -71,6 +75,7 @@ const initialDiagnostics: ScannerDiagnostics = {
   decoderInit: 'initializing...',
   scanAttempts: 0,
   qrDetected: false,
+  qrDetectionState: 'Searching',
   qrDetectedLength: 0,
   decoderUsed: 'None',
   jsonParsed: false,
@@ -110,7 +115,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // QR display & pre-rendered cache state
-  const [packets, setPackets] = useState<QrSignalingPacket[]>([]);
+  const [packets, setPackets] = useState<AnyQrPacket[]>([]);
   const [activeFrameIndex, setActiveFrameIndex] = useState(0);
   const [cachedQrUrls, setCachedQrUrls] = useState<string[]>([]);
   // Prioritize ONE static QR: Auto-cycling is disabled by default!
@@ -129,7 +134,19 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
   const barcodeDetectorRef = useRef<any>(null);
   const isScanningActiveRef = useRef<boolean>(false);
   const isDecodingRef = useRef<boolean>(false);
-  const lastDecoderUsedRef = useRef<'BarcodeDetector' | 'jsQR' | 'None'>('None');
+  const lastDecoderUsedRef = useRef<string>('None');
+
+  const setVideoRef = useCallback((node: HTMLVideoElement | null) => {
+    videoRef.current = node;
+    if (node && mediaStreamRef.current) {
+      if (node.srcObject !== mediaStreamRef.current) {
+        node.srcObject = mediaStreamRef.current;
+        node.setAttribute('playsinline', 'true');
+        node.muted = true;
+        node.play().catch((e) => console.warn('[DIAG VIDEO] video.play() error:', e));
+      }
+    }
+  }, []);
 
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -235,6 +252,19 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
       transport.subscribe('onConnectionStateChange', (state: any, reason?: string) => {
         console.log(`[DIAG STATE] [${new Date().toISOString()}] AirGappedModal received onConnectionStateChange -> ${state} (current phase: ${phase}, reason: ${reason || 'none'})`);
         if (state === 'FAILED') {
+          // Do not transition to FAILED while actively waiting for peer to scan QR code
+          if (
+            phase === 'WAITING_FOR_SENDER' ||
+            phase === 'WAITING_FOR_RECEIVER' ||
+            phase === 'GENERATING_ANSWER' ||
+            phase === 'CREATING_OFFER' ||
+            phase === 'GENERATING_QR'
+          ) {
+            console.warn(
+              `[DIAG WARN] [${new Date().toISOString()}] Suppressing premature FAILED transition while in phase: ${phase}. Handshake in progress.`
+            );
+            return;
+          }
           setPhase('FAILED');
           setErrorMessage(reason || 'Failed to establish direct peer connection. Check local network.');
           stopCamera();
@@ -276,6 +306,18 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     setErrorMessage(null);
 
     try {
+      // Warm up camera permission on sender to unmask local host IPv4 addresses (RFC 8835 / Chrome mDNS)
+      if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+        try {
+          console.log(`[DIAG CAMERA] [${new Date().toISOString()}] Upfront camera warmup to unmask private IPv4 candidates...`);
+          const warmupStream = await navigator.mediaDevices.getUserMedia({ video: true });
+          warmupStream.getTracks().forEach((track) => track.stop());
+          console.log(`[DIAG CAMERA] [${new Date().toISOString()}] Upfront camera warmup successful; host IPv4 addresses unmasked.`);
+        } catch (warmupErr) {
+          console.warn('[DIAG CAMERA] Upfront camera warmup skipped or denied:', warmupErr);
+        }
+      }
+
       setPhase('GENERATING_QR');
       const generatedPackets = await transport.createOfferPayloads(sessionId);
       console.log(`[DIAG OFFERS] [${new Date().toISOString()}] Generated packets received in modal: ${generatedPackets.length}`);
@@ -296,7 +338,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     }
   };
 
-  // Pre-render ALL QR frame images ONCE upfront with Error Correction Level 'L' and high resolution
+  // Pre-render ALL QR frame images ONCE upfront with Error Correction Level 'M', width 560, and standard 4-module quiet zone
   useEffect(() => {
     if (packets.length === 0) {
       setCachedQrUrls([]);
@@ -306,16 +348,16 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     let active = true;
     const renderStartTime = performance.now();
     console.log(
-      `[DIAG 14] Pre-rendering ${packets.length} QR frame(s) with Error Correction 'L', width 380, and crisp margins...`
+      `[DIAG 14] Pre-rendering ${packets.length} QR frame(s) with Error Correction 'M', width 560, and 4-module quiet zone...`
     );
 
     Promise.all(
       packets.map((pkt) => {
         const raw = JSON.stringify(pkt);
         return QRCode.toDataURL(raw, {
-          width: 380,
-          margin: 3,
-          errorCorrectionLevel: 'L',
+          width: 560,
+          margin: 4,
+          errorCorrectionLevel: 'M',
           color: {
             dark: '#000000',
             light: '#ffffff'
@@ -489,7 +531,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
         try {
           let decodedText: string | null = null;
-          let engineUsed: 'BarcodeDetector' | 'jsQR' | 'None' = 'None';
+          let engineUsed: 'BarcodeDetector' | 'jsQR' | 'jsQR (Center Zoom)' | 'jsQR (Full Frame)' | 'None' = 'None';
 
           // Engine 1: BarcodeDetector
           if (barcodeDetectorRef.current) {
@@ -511,38 +553,59 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
             const canvas = canvasRef.current || document.createElement('canvas');
             const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-            if (ctx) {
-              // Scale to max 640px wide for rapid decoding without losing QR module resolution
-              const scale = Math.min(1, 640 / vw);
-              const w = Math.floor(vw * scale);
-              const h = Math.floor(vh * scale);
-              if (canvas.width !== w || canvas.height !== h) {
-                canvas.width = w;
-                canvas.height = h;
+            if (ctx && vw > 0 && vh > 0) {
+              // Pass A: Center-crop scan at 1:1 scale (no downscaling blur)
+              // Highly effective when aiming camera at a laptop screen from 20-40cm away
+              const cropW = Math.floor(vw * 0.70);
+              const cropH = Math.floor(vh * 0.70);
+              const cropX = Math.floor(vw * 0.15);
+              const cropY = Math.floor(vh * 0.15);
+
+              if (canvas.width !== cropW || canvas.height !== cropH) {
+                canvas.width = cropW;
+                canvas.height = cropH;
               }
+              ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+              const cropImgData = ctx.getImageData(0, 0, cropW, cropH);
+              const cropResult = jsQR(cropImgData.data, cropW, cropH, { inversionAttempts: 'attemptBoth' });
 
-              ctx.drawImage(video, 0, 0, w, h);
-              const imgData = ctx.getImageData(0, 0, w, h);
-              const qrResult = jsQR(imgData.data, w, h, { inversionAttempts: 'attemptBoth' });
+              if (cropResult && cropResult.data) {
+                decodedText = cropResult.data;
+                engineUsed = 'jsQR (Center Zoom)';
+              } else {
+                // Pass B: Full-frame scan (if center zoom didn't match)
+                const scale = Math.min(1, 960 / vw);
+                const fw = Math.floor(vw * scale);
+                const fh = Math.floor(vh * scale);
+                if (canvas.width !== fw || canvas.height !== fh) {
+                  canvas.width = fw;
+                  canvas.height = fh;
+                }
+                ctx.drawImage(video, 0, 0, fw, fh);
+                const fullImgData = ctx.getImageData(0, 0, fw, fh);
+                const fullResult = jsQR(fullImgData.data, fw, fh, { inversionAttempts: 'attemptBoth' });
 
-              if (qrResult && qrResult.data) {
-                decodedText = qrResult.data;
-                engineUsed = 'jsQR';
+                if (fullResult && fullResult.data) {
+                  decodedText = fullResult.data;
+                  engineUsed = 'jsQR (Full Frame)';
+                }
               }
             }
           }
 
           if (decodedText) {
-            lastDecoderUsedRef.current = engineUsed;
-            setDiagnostics((prev) => ({
-              ...prev,
-              scanAttempts: attempts,
-              qrDetected: true,
-              qrDetectedLength: decodedText!.length,
-              decoderUsed: engineUsed
-            }));
+            lastDecoderUsedRef.current = engineUsed.startsWith('jsQR') ? 'jsQR' : 'BarcodeDetector';
             console.log(`[DIAG SCANNER] Recognized QR Code via ${engineUsed}! Length: ${decodedText.length}`);
-            await handleScannedPayload(decodedText);
+            await handleScannedPayload(decodedText, engineUsed);
+          } else {
+            // No QR detected in this frame
+            if (attempts % 8 === 0) {
+              setDiagnostics((prev) => ({
+                ...prev,
+                qrDetected: false,
+                qrDetectionState: 'Searching'
+              }));
+            }
           }
         } catch (frameErr: any) {
           console.warn('[DIAG SCANNER] Frame processing exception:', frameErr);
@@ -564,40 +627,70 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     requestAnimationFrame(scanFrame);
   };
 
-  const handleScannedPayload = async (rawText: string) => {
+  const handleScannedPayload = async (rawText: string, engineUsed: string = 'None') => {
     try {
       // Independent scanner test mode verification
       if (scannerTestMode) {
         try {
           const parsed = JSON.parse(rawText);
           if (parsed.peerport === 'scanner-test') {
-            setScannerTestResult(`✓ Test QR Code Verified! (${rawText.length} chars decoded via ${lastDecoderUsedRef.current})`);
+            setScannerTestResult(`✓ Test QR Code Verified! (${rawText.length} chars decoded via ${engineUsed})`);
             return;
           }
         } catch {
           // Non-JSON in test mode
         }
-        setScannerTestResult(`Recognized QR (${rawText.length} chars via ${lastDecoderUsedRef.current}): ${rawText.slice(0, 40)}...`);
+        setScannerTestResult(`Recognized QR (${rawText.length} chars via ${engineUsed}): ${rawText.slice(0, 40)}...`);
         return;
       }
 
-      // Step 6: Parse & validate packet
-      const packet = parseAndValidateQrPayload(rawText);
+      // Step 1: Validate payload format (supports both CompactSdpPacket v2 and Deflate QrSignalingPacket v1)
+      let packet: AnyQrPacket;
+      try {
+        packet = parseAndValidateQrPayload(rawText);
+      } catch (validationErr: any) {
+        console.warn('[DIAG SCANNER] Scanned payload validation failed:', validationErr.message);
+        setDiagnostics((prev) => ({
+          ...prev,
+          qrDetected: true,
+          qrDetectionState: 'Decoded (Non-PeerPort)',
+          qrDetectedLength: rawText.length,
+          decoderUsed: engineUsed,
+          lastError: validationErr.message || 'Scanned payload is not a valid PeerPort signaling packet'
+        }));
+        return;
+      }
+
+      // Step 2: Valid PeerPort packet recognized
+      const isCompact = isCompactSdpPacket(packet);
+      const packetTypeName = isCompact
+        ? (packet.type === 'offer' ? 'compact-offer' : 'compact-answer')
+        : packet.type;
+      const legacy = !isCompact ? (packet as QrSignalingPacket) : null;
+      const frameDesc = legacy
+        ? `Frame ${legacy.idx + 1} of ${legacy.total}`
+        : 'Static 1/1';
+
       setDiagnostics((prev) => ({
         ...prev,
+        qrDetected: true,
+        qrDetectionState: 'Decoded (Valid Packet)',
+        qrDetectedLength: rawText.length,
+        decoderUsed: engineUsed,
         jsonParsed: true,
-        packetType: packet.type,
-        framesReceived: `Frame ${packet.idx + 1} of ${packet.total}`
+        packetType: packetTypeName,
+        framesReceived: frameDesc,
+        lastError: null
       }));
 
       const expectedSession = role === 'SENDER' ? sessionId : undefined;
       const result = await reassemblerRef.current.processPacket(packet, expectedSession);
       const progress = reassemblerRef.current.getProgress();
       setScanProgress(progress);
-      setLastScannedFrame(packet.idx + 1);
+      setLastScannedFrame(legacy ? legacy.idx + 1 : 1);
 
       if (result) {
-        // Step 9 & 10: Reassembled and Decompressed
+        // Step 4: Reassembled and Decompressed
         setDiagnostics((prev) => ({
           ...prev,
           payloadReassembled: true,
@@ -765,7 +858,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
             {/* Test Video Viewport */}
             <div className="relative w-full h-44 bg-black rounded-xl overflow-hidden mb-2 border border-amber-300 dark:border-amber-700 flex items-center justify-center">
-              <video ref={videoRef} className="w-full h-full object-cover" />
+              <video ref={setVideoRef} className="w-full h-full object-cover" />
               {cameraActive && (
                 <div className="absolute inset-0 border-2 border-amber-500/60 rounded-xl pointer-events-none animate-pulse m-4" />
               )}
@@ -904,12 +997,13 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
                 <span className="text-xs text-slate-500 font-medium">Generating local SDP offer...</span>
               </div>
             ) : (
-              <div className="p-4 bg-white rounded-3xl shadow-lg border border-slate-200 dark:border-slate-700 mb-3 flex flex-col items-center justify-center min-w-[280px] min-h-[280px] sm:min-w-[340px] sm:min-h-[340px]">
+              <div className="p-5 sm:p-6 bg-white rounded-3xl shadow-xl border border-slate-200 dark:border-slate-700 mb-3 flex flex-col items-center justify-center min-w-[280px] min-h-[280px] sm:min-w-[360px] sm:min-h-[360px]">
                 {currentQrUrl ? (
                   <img
                     src={currentQrUrl}
                     alt={`Offer QR Frame ${activeFrameIndex + 1}`}
-                    className="w-64 h-64 sm:w-80 sm:h-80 object-contain rounded-xl"
+                    style={{ imageRendering: 'pixelated' }}
+                    className="w-64 h-64 sm:w-80 sm:h-80 md:w-96 md:h-96 object-contain"
                   />
                 ) : (
                   <div className="flex flex-col items-center justify-center p-8 text-center">
@@ -1036,7 +1130,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
             {/* Video Viewport */}
             <div className="relative w-full max-w-xs h-64 bg-black rounded-3xl overflow-hidden mb-3 border border-slate-300 dark:border-slate-700 flex items-center justify-center shadow-lg">
-              <video ref={videoRef} className="w-full h-full object-cover" />
+              <video ref={setVideoRef} className="w-full h-full object-cover" />
               {cameraActive && (
                 <div className="absolute inset-0 border-2 border-sky-500/60 rounded-3xl pointer-events-none animate-pulse m-6" />
               )}
@@ -1060,7 +1154,9 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
               <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px]">
                 <div>1. Camera: <span className={diagnostics.cameraActive ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.cameraActive ? `✓ ${diagnostics.cameraResolution}` : '○ Inactive'}</span></div>
                 <div>2. Decoder: <span className="text-sky-400">{diagnostics.decoderInit}</span></div>
-                <div>3. QR Detected: <span className={diagnostics.qrDetected ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.qrDetected ? `✓ ${diagnostics.qrDetectedLength} chars` : '○ Scanning...'}</span></div>
+                <div>3. QR Detected: <span className={diagnostics.qrDetected ? 'text-emerald-400 font-bold' : diagnostics.qrDetectionState !== 'Searching' ? 'text-amber-400 font-bold' : 'text-slate-500'}>
+                  {diagnostics.qrDetected ? `✓ ${diagnostics.qrDetectionState} (${diagnostics.qrDetectedLength}c)` : diagnostics.qrDetectionState !== 'Searching' ? `⚠ ${diagnostics.qrDetectionState}` : '○ Scanning...'}
+                </span></div>
                 <div>4. Engine Used: <span className="text-emerald-400">{diagnostics.decoderUsed}</span></div>
                 <div>5. JSON Packet: <span className={diagnostics.jsonParsed ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.jsonParsed ? `✓ ${diagnostics.packetType}` : '○ Pending'}</span></div>
                 <div>6. Reassembled: <span className={diagnostics.payloadReassembled ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.payloadReassembled ? '✓ Complete' : '○ Pending'}</span></div>
@@ -1124,7 +1220,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
             {/* Video Viewport */}
             <div className="relative w-full max-w-xs h-64 bg-black rounded-3xl overflow-hidden mb-3 border border-slate-300 dark:border-slate-700 flex items-center justify-center shadow-lg">
-              <video ref={videoRef} className="w-full h-full object-cover" />
+              <video ref={setVideoRef} className="w-full h-full object-cover" />
               {cameraActive && (
                 <div className="absolute inset-0 border-2 border-emerald-500/60 rounded-3xl pointer-events-none animate-pulse m-6" />
               )}
@@ -1148,7 +1244,9 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
               <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px]">
                 <div>1. Camera: <span className={diagnostics.cameraActive ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.cameraActive ? `✓ ${diagnostics.cameraResolution}` : '○ Inactive'}</span></div>
                 <div>2. Decoder: <span className="text-sky-400">{diagnostics.decoderInit}</span></div>
-                <div>3. QR Detected: <span className={diagnostics.qrDetected ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.qrDetected ? `✓ ${diagnostics.qrDetectedLength} chars` : '○ Scanning...'}</span></div>
+                <div>3. QR Detected: <span className={diagnostics.qrDetected ? 'text-emerald-400 font-bold' : diagnostics.qrDetectionState !== 'Searching' ? 'text-amber-400 font-bold' : 'text-slate-500'}>
+                  {diagnostics.qrDetected ? `✓ ${diagnostics.qrDetectionState} (${diagnostics.qrDetectedLength}c)` : diagnostics.qrDetectionState !== 'Searching' ? `⚠ ${diagnostics.qrDetectionState}` : '○ Scanning...'}
+                </span></div>
                 <div>4. Engine Used: <span className="text-emerald-400">{diagnostics.decoderUsed}</span></div>
                 <div>5. JSON Packet: <span className={diagnostics.jsonParsed ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.jsonParsed ? `✓ ${diagnostics.packetType}` : '○ Pending'}</span></div>
                 <div>6. Reassembled: <span className={diagnostics.payloadReassembled ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.payloadReassembled ? '✓ Complete' : '○ Pending'}</span></div>
@@ -1214,12 +1312,13 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
                 <span className="text-xs text-slate-500 font-medium">Generating local SDP answer...</span>
               </div>
             ) : (
-              <div className="p-4 bg-white rounded-3xl shadow-lg border border-slate-200 dark:border-slate-700 mb-3 flex flex-col items-center justify-center min-w-[280px] min-h-[280px] sm:min-w-[340px] sm:min-h-[340px]">
+              <div className="p-5 sm:p-6 bg-white rounded-3xl shadow-xl border border-slate-200 dark:border-slate-700 mb-3 flex flex-col items-center justify-center min-w-[280px] min-h-[280px] sm:min-w-[360px] sm:min-h-[360px]">
                 {currentQrUrl ? (
                   <img
                     src={currentQrUrl}
                     alt={`Answer QR Frame ${activeFrameIndex + 1}`}
-                    className="w-64 h-64 sm:w-80 sm:h-80 object-contain rounded-xl"
+                    style={{ imageRendering: 'pixelated' }}
+                    className="w-64 h-64 sm:w-80 sm:h-80 md:w-96 md:h-96 object-contain"
                   />
                 ) : (
                   <div className="flex flex-col items-center justify-center p-8 text-center">

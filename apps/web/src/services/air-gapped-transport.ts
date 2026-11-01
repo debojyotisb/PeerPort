@@ -21,7 +21,9 @@ import { getLocalDeviceInfo } from './device-info.js';
 import {
   createQrPayloads,
   waitForIceGathering,
-  QrSignalingPacket
+  unmaskMdnsCandidateIfKnown,
+  QrSignalingPacket,
+  AnyQrPacket
 } from './qr-signaling.js';
 
 /**
@@ -101,7 +103,7 @@ export class AirGappedTransport implements PeerTransport {
    * Creates RTCPeerConnection with iceServers: [], creates DataChannel, gathers local host ICE candidates,
    * compresses SDP offer, and returns QR signaling packets.
    */
-  async createOfferPayloads(sessionId: string): Promise<QrSignalingPacket[]> {
+  async createOfferPayloads(sessionId: string): Promise<AnyQrPacket[]> {
     const startTime = performance.now();
     console.log(`[DIAG 2] [${new Date().toISOString()}] RTCPeerConnection creation started for session ${sessionId}`);
     this.currentSessionId = sessionId;
@@ -161,8 +163,9 @@ export class AirGappedTransport implements PeerTransport {
     }
 
     this.updateState('CONNECTING');
+    const processedAnswerSdp = unmaskMdnsCandidateIfKnown(answerSdp);
     await this.peerConnection.setRemoteDescription(
-      new RTCSessionDescription({ type: 'answer', sdp: answerSdp })
+      new RTCSessionDescription({ type: 'answer', sdp: processedAnswerSdp })
     );
 
     this.notifyPeerConnected();
@@ -184,7 +187,7 @@ export class AirGappedTransport implements PeerTransport {
    * Sets the sender's decompressed SDP offer as remote description, generates an SDP answer,
    * gathers local host ICE candidates, compresses SDP answer, and returns QR signaling packets.
    */
-  async createAnswerPayloads(sessionId: string, offerSdp: string): Promise<QrSignalingPacket[]> {
+  async createAnswerPayloads(sessionId: string, offerSdp: string): Promise<AnyQrPacket[]> {
     this.currentSessionId = sessionId;
 
     try {
@@ -197,8 +200,9 @@ export class AirGappedTransport implements PeerTransport {
     }
     this.setupPeerConnectionEvents();
 
+    const processedOfferSdp = unmaskMdnsCandidateIfKnown(offerSdp);
     await this.peerConnection.setRemoteDescription(
-      new RTCSessionDescription({ type: 'offer', sdp: offerSdp })
+      new RTCSessionDescription({ type: 'offer', sdp: processedOfferSdp })
     );
 
     const answer = await this.peerConnection.createAnswer();
@@ -411,14 +415,32 @@ export class AirGappedTransport implements PeerTransport {
 
     this.peerConnection.onconnectionstatechange = () => {
       const state = this.peerConnection?.connectionState;
+      console.log(
+        `[DIAG STATE] [${new Date().toISOString()}] peerConnection state -> ${state} (internal: ${this.connectionState}, watchdog: ${!!this.connectionTimer})`
+      );
+
       if (state === 'connected') {
-        this.clearConnectionTimer();
+        if (this.dataChannel && this.dataChannel.readyState === 'open') {
+          this.clearConnectionTimer();
+        }
       } else if (state === 'failed') {
-        this.clearConnectionTimer();
+        // Suppress premature failure while handshake watchdog timer is active
+        if (this.connectionTimer) {
+          console.warn(
+            `[DIAG WARN] [${new Date().toISOString()}] peerConnection failed while awaiting peer QR scan. Suppressing premature abort.`
+          );
+          return;
+        }
         if (this.connectionState !== 'COMPLETED') {
           this.updateState('FAILED', 'Direct peer link failed. Verify devices are on the same Wi-Fi or phone hotspot.');
         }
       } else if (state === 'disconnected') {
+        if (this.connectionTimer) {
+          console.warn(
+            `[DIAG WARN] [${new Date().toISOString()}] peerConnection disconnected while awaiting peer QR scan. Suppressing premature abort.`
+          );
+          return;
+        }
         if (this.connectionState !== 'COMPLETED') {
           this.updateState('DISCONNECTED', 'Direct peer link disconnected');
         }
@@ -431,6 +453,9 @@ export class AirGappedTransport implements PeerTransport {
 
     channel.onopen = () => {
       this.clearConnectionTimer();
+      console.log(
+        `[DIAG CHANNEL] [${new Date().toISOString()}] DataChannel onopen (readyState: ${channel.readyState}, pcState: ${this.peerConnection?.connectionState})`
+      );
       for (const listener of this.listeners.onChannelReady) {
         listener();
       }

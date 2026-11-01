@@ -10,7 +10,9 @@ import {
   waitForIceGathering,
   pruneSdpForDataChannel,
   parseIceCandidateString,
+  unmaskMdnsCandidateIfKnown,
   QR_SIGNALING_VERSION,
+  QrSignalingPacket,
   DEFAULT_MAX_CHUNK_LENGTH
 } from '../services/qr-signaling.js';
 
@@ -101,17 +103,28 @@ a=rtcp-rsize`;
   });
 
   describe('createQrPayloads', () => {
-    it('generates a single QR packet when payload is within max chunk length', async () => {
+    it('generates a compact single QR packet when payload can be compacted', async () => {
       const packets = await createQrPayloads('ses_123', 'offer', MOCK_SDP, 1000);
       expect(packets).toHaveLength(1);
       expect(packets[0]).toMatchObject({
-        v: QR_SIGNALING_VERSION,
+        v: 2,
         sid: 'ses_123',
+        type: 'offer'
+      });
+      expect(packets[0].exp).toBeGreaterThan(Date.now());
+    });
+
+    it('falls back to Deflate single QR packet when compact extraction is not applicable', async () => {
+      const nonCompactSdp = 'v=0\r\no=- 123 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=application 9 UDP/DTLS/SCTP 5000\r\n';
+      const packets = await createQrPayloads('ses_deflate', 'offer', nonCompactSdp, 1000);
+      expect(packets).toHaveLength(1);
+      expect(packets[0]).toMatchObject({
+        v: QR_SIGNALING_VERSION,
+        sid: 'ses_deflate',
         type: 'offer',
         idx: 0,
         total: 1
       });
-      expect(packets[0].exp).toBeGreaterThan(Date.now());
     });
 
     it('segments payload into multiple sequential QR packets when chunk length is restricted', async () => {
@@ -123,9 +136,9 @@ a=rtcp-rsize`;
         expect(p.v).toBe(QR_SIGNALING_VERSION);
         expect(p.sid).toBe('ses_456');
         expect(p.type).toBe('answer');
-        expect(p.idx).toBe(index);
-        expect(p.total).toBe(packets.length);
-        expect(p.data.length).toBeLessThanOrEqual(maxChunkLength);
+        expect((p as any).idx).toBe(index);
+        expect((p as any).total).toBe(packets.length);
+        expect((p as any).data.length).toBeLessThanOrEqual(maxChunkLength);
       });
     });
 
@@ -136,14 +149,28 @@ a=rtcp-rsize`;
   });
 
   describe('parseAndValidateQrPayload', () => {
-    it('successfully parses valid JSON signaling packet', async () => {
-      const packets = await createQrPayloads('ses_valid', 'offer', MOCK_SDP);
-      const rawText = JSON.stringify(packets[0]);
+    it('successfully parses valid JSON signaling packet (compact v2 and deflate v1)', async () => {
+      // Test compact v2
+      const compactPackets = await createQrPayloads('ses_valid_v2', 'offer', MOCK_SDP);
+      const parsedCompact = parseAndValidateQrPayload(JSON.stringify(compactPackets[0]));
+      expect(parsedCompact.sid).toBe('ses_valid_v2');
+      expect(parsedCompact.type).toBe('offer');
+      expect(parsedCompact.v).toBe(2);
 
-      const parsed = parseAndValidateQrPayload(rawText);
-      expect(parsed.sid).toBe('ses_valid');
-      expect(parsed.type).toBe('offer');
-      expect(parsed.v).toBe(QR_SIGNALING_VERSION);
+      // Test deflate v1
+      const legacyPacket: QrSignalingPacket = {
+        v: QR_SIGNALING_VERSION,
+        sid: 'ses_valid_v1',
+        type: 'offer',
+        idx: 0,
+        total: 1,
+        data: 'compressed_base64_data',
+        exp: Date.now() + 60000
+      };
+      const parsedLegacy = parseAndValidateQrPayload(JSON.stringify(legacyPacket));
+      expect(parsedLegacy.sid).toBe('ses_valid_v1');
+      expect(parsedLegacy.type).toBe('offer');
+      expect(parsedLegacy.v).toBe(QR_SIGNALING_VERSION);
     });
 
     it('rejects oversized payloads (> 4096 bytes) for DoS protection', () => {
@@ -223,7 +250,8 @@ a=rtcp-rsize`;
       expect(result).not.toBeNull();
       expect(result?.sessionId).toBe('ses_single');
       expect(result?.type).toBe('offer');
-      expect(result?.sdp).toBe(EXPECTED_PRUNED_SDP);
+      expect(result?.sdp).toContain('a=ice-ufrag:K8sZ');
+      expect(result?.sdp).toContain('a=ice-pwd:9xY58W3pQ1vL0rT6bN4mA2cD');
     });
 
     it('reassembles multi-frame packets in sequential order', async () => {
@@ -334,6 +362,33 @@ a=rtcp-rsize`;
     });
   });
 
+  describe('unmaskMdnsCandidateIfKnown', () => {
+    it('injects unmasked candidate line and updates c= line when mDNS candidates are present and fallback IP is provided', () => {
+      const mdnsSdp = `v=0\r\no=- 123 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 0.0.0.0\r\na=candidate:1 1 UDP 2130706431 8f92-4f32.local 54321 typ host\r\na=end-of-candidates\r\n`;
+      const unmasked = unmaskMdnsCandidateIfKnown(mdnsSdp, '192.168.43.50');
+
+      expect(unmasked).toContain('a=candidate:1 1 UDP 2130706431 192.168.43.50 54321 typ host');
+      expect(unmasked).toContain('a=candidate:1 1 UDP 2130706431 8f92-4f32.local 54321 typ host');
+      expect(unmasked).toContain('c=IN IP4 192.168.43.50');
+    });
+
+    it('preserves SDP untouched when fallback IP is loopback or invalid', () => {
+      const mdnsSdp = `v=0\r\nc=IN IP4 0.0.0.0\r\na=candidate:1 1 UDP 2130706431 8f92-4f32.local 54321 typ host\r\n`;
+      const untouched1 = unmaskMdnsCandidateIfKnown(mdnsSdp, '127.0.0.1');
+      expect(untouched1).toBe(mdnsSdp);
+
+      const untouched2 = unmaskMdnsCandidateIfKnown(mdnsSdp, 'invalid-ip');
+      expect(untouched2).toBe(mdnsSdp);
+    });
+
+    it('does not inject duplicates if candidates are already non-mDNS', () => {
+      const normalSdp = `v=0\r\nc=IN IP4 192.168.1.10\r\na=candidate:1 1 UDP 2130706431 192.168.1.10 54321 typ host\r\n`;
+      const result = unmaskMdnsCandidateIfKnown(normalSdp, '192.168.43.50');
+      expect(result).not.toContain('192.168.43.50');
+      expect(result).toContain('192.168.1.10');
+    });
+  });
+
   describe('jsQR Compatibility & End-to-End Decode', () => {
     it('successfully decodes a generated single-frame QR packet using jsQR and verifies SDP reconstruction', async () => {
       const packets = await createQrPayloads('ses_e2e_jsqr', 'offer', MOCK_SDP);
@@ -372,12 +427,15 @@ a=rtcp-rsize`;
       expect(decoded).not.toBeNull();
       expect(decoded?.data).toBe(jsonText);
 
-      // Verify that decoded QR packet validates and decompresses back to expected pruned SDP
+      // Verify that decoded QR packet validates and reassembles back to valid SDP
       const parsedPacket = parseAndValidateQrPayload(decoded!.data);
       expect(parsedPacket.sid).toBe('ses_e2e_jsqr');
-      expect(parsedPacket.type).toBe('offer');
-      const decompressed = await decompressSdp(parsedPacket.data);
-      expect(decompressed).toBe(EXPECTED_PRUNED_SDP);
+      const reassembler = new QrPayloadReassembler();
+      const result = await reassembler.processPacket(parsedPacket);
+      expect(result?.sessionId).toBe('ses_e2e_jsqr');
+      expect(result?.type).toBe('offer');
+      expect(result?.sdp).toContain('a=ice-ufrag:K8sZ');
+      expect(result?.sdp).toContain('m=application 9 UDP/DTLS/SCTP webrtc-datachannel');
     });
   });
 });
