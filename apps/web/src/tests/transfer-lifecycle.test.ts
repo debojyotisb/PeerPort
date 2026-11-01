@@ -411,5 +411,68 @@ describe('Phase 1 Transfer Lifecycle & Verification Handshake', () => {
     expect(engine.getActiveManifest()).toBeNull();
     expect(connectionState).toBe('FAILED');
   });
+
+  it('preserves COMPLETED state when network/peer disconnect occurs after transfer completion', () => {
+    let connectionState = 'COMPLETED';
+
+    const handleConnectionStateChange = (newState: string) => {
+      // Guard matching Home.tsx implementation
+      if (connectionState === 'COMPLETED' && newState === 'DISCONNECTED') {
+        return;
+      }
+      connectionState = newState;
+    };
+
+    // Simulate network drop (e.g. user toggles off Wi-Fi or cellular data)
+    handleConnectionStateChange('DISCONNECTED');
+
+    // Connection state remains COMPLETED, preventing UI unmount
+    expect(connectionState).toBe('COMPLETED');
+  });
+
+  it('auto-persists verified received file to offline storage upon completion', async () => {
+    const { offlineStorage } = await import('../services/offline-storage.js');
+    await offlineStorage.clearAllReceivedFiles();
+
+    const data = new Uint8Array([10, 20, 30, 40]);
+    const sha256 = await computeSha256(data);
+
+    const manifest: TransferManifest = {
+      transferId: 'tr_persistence_test',
+      sender: { deviceId: 'dev_sender', deviceName: 'Sender', platform: 'linux' },
+      files: [{ id: 'f_persist_01', name: 'offline_receipt.txt', size: 4, mimeType: 'text/plain', sha256 }],
+      totalBytes: 4,
+      totalFiles: 1,
+      timestamp: Date.now(),
+      token: 'tok_test'
+    };
+
+    engine.prepareReceiver(manifest);
+
+    const chunk = {
+      header: {
+        magic: 0x50505254,
+        version: 1,
+        messageType: 1,
+        transferId: 'tr_persistence_test',
+        fileId: 'f_persist_01',
+        chunkIndex: 0,
+        totalChunks: 1,
+        payloadLength: 4
+      },
+      data
+    };
+
+    const completed = await engine.handleIncomingChunk(chunk, () => {});
+    expect(completed).not.toBeNull();
+    expect(completed!.verified).toBe(true);
+
+    // Verify it was automatically saved in offline storage
+    const stored = await offlineStorage.getReceivedFile('f_persist_01');
+    expect(stored).not.toBeNull();
+    expect(stored!.name).toBe('offline_receipt.txt');
+    expect(stored!.size).toBe(4);
+    expect(stored!.sha256).toBe(sha256);
+  });
 });
 

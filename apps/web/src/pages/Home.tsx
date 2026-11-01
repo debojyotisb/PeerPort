@@ -7,9 +7,13 @@ import { ApprovalDialog } from '../components/ApprovalDialog.js';
 import { TransferModal } from '../components/TransferModal.js';
 import { CompletionModal } from '../components/CompletionModal.js';
 import { ArchitectureHelpModal } from '../components/ArchitectureHelpModal.js';
+import { ReceivedFilesDrawer } from '../components/ReceivedFilesDrawer.js';
+import { AirGappedModal } from '../components/AirGappedModal.js';
+import { offlineStorage, StoredReceivedFile } from '../services/offline-storage.js';
 import { useConnectionStore } from '../state/connection-store.js';
 import { useTransferStore } from '../state/transfer-store.js';
 import { WebRtcTransport } from '../services/webrtc-transport.js';
+import { AirGappedTransport } from '../services/air-gapped-transport.js';
 import { TransferEngine } from '../services/transfer-engine.js';
 import { generateSecureId } from '../services/device-info.js';
 import { PeerConnection, TransferManifest, TransferCompletePayload } from '@peerport/shared-types';
@@ -42,11 +46,29 @@ export const Home: React.FC = () => {
   } = useTransferStore();
 
   const [isQrModalOpen, setIsQrModalOpen] = useState(false);
+  const [isAirGappedModalOpen, setIsAirGappedModalOpen] = useState(false);
+  const [airGappedRole, setAirGappedRole] = useState<'SENDER' | 'RECEIVER'>('SENDER');
   const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const [isSavedFilesOpen, setIsSavedFilesOpen] = useState(false);
+  const [savedFiles, setSavedFiles] = useState<StoredReceivedFile[]>([]);
   const [transferEngine] = useState(() => new TransferEngine());
 
+  const refreshSavedFiles = async () => {
+    try {
+      const files = await offlineStorage.getAllReceivedFiles();
+      setSavedFiles(files);
+    } catch (err) {
+      console.warn('Failed to load saved files from offline storage:', err);
+    }
+  };
+
+  useEffect(() => {
+    refreshSavedFiles();
+  }, []);
+
   // Stable references across component renders and transfer lifecycles
-  const transportRef = useRef<WebRtcTransport | null>(null);
+  const transportRef = useRef<WebRtcTransport | AirGappedTransport | null>(null);
+  const airGappedTransportRef = useRef<AirGappedTransport | null>(null);
   const connectionRef = useRef<PeerConnection | null>(null);
   const approveCallbackRef = useRef<((accepted: boolean) => Promise<void>) | null>(null);
   const activeManifestRef = useRef<TransferManifest | null>(null);
@@ -130,7 +152,21 @@ export const Home: React.FC = () => {
       window.history.replaceState({}, document.title, window.location.pathname);
     }
 
-    const webrtc = new WebRtcTransport();
+    const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    const savedLocalIp = typeof localStorage !== 'undefined' ? localStorage.getItem('peerport_local_ip') : null;
+    const isExplicitLocalMode = Boolean(savedLocalIp && savedLocalIp.trim().length > 0);
+
+    // Only activate local signaling if genuinely offline or if explicitly configured for local hotspot
+    const useLocalSignaling = isOffline || isExplicitLocalMode;
+    const effectiveHost = savedLocalIp?.trim() || (typeof window !== 'undefined' ? window.location.hostname : 'localhost');
+
+    const localSignalingUrl = useLocalSignaling && typeof window !== 'undefined'
+      ? `ws://${effectiveHost}:8088`
+      : undefined;
+
+    const iceServers = useLocalSignaling ? [] : undefined;
+
+    const webrtc = new WebRtcTransport(localSignalingUrl, iceServers);
     transportRef.current = webrtc;
     transportCleanupRef.current = setupTransportListeners(webrtc, 'SENDER');
 
@@ -160,7 +196,26 @@ export const Home: React.FC = () => {
     activeTransferManifestRef.current = null;
     sentHashesRef.current.clear();
 
-    const webrtc = new WebRtcTransport();
+    // Check if custom signaling URL was passed (e.g. ?signal=ws://192.168.43.100:8088)
+    let customSignal: string | undefined = undefined;
+    if (typeof window !== 'undefined') {
+      const urlParams = new URLSearchParams(window.location.search);
+      customSignal = urlParams.get('signal') || undefined;
+    }
+
+    const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    const isExplicitLocal = Boolean(customSignal);
+    const useLocal = isOffline || isExplicitLocal;
+
+    const targetSignaling = customSignal || (
+      isOffline && typeof window !== 'undefined'
+        ? `ws://${window.location.hostname}:8088`
+        : undefined
+    );
+
+    const iceServers = useLocal ? [] : undefined;
+
+    const webrtc = new WebRtcTransport(targetSignaling, iceServers);
     transportRef.current = webrtc;
     transportCleanupRef.current = setupTransportListeners(webrtc, 'RECEIVER');
 
@@ -173,11 +228,70 @@ export const Home: React.FC = () => {
     }
   };
 
-  const setupTransportListeners = (webrtc: WebRtcTransport, currentRole: 'SENDER' | 'RECEIVER'): (() => void) => {
+  const handleStartAirGappedShare = async () => {
+    if (selectedFiles.length === 0) {
+      alert('Please select at least one file before generating an air-gapped QR transfer.');
+      return;
+    }
+
+    transportCleanupRef.current?.();
+    transportCleanupRef.current = null;
+    transportRef.current?.close();
+
+    const sessionId = generateSecureId('ses');
+    setRoomId(sessionId);
+    setRole('SENDER');
+    setMode('QR_MANUAL');
+    setConnectionState('CONNECTING');
+
+    activeManifestRef.current = null;
+    activeTransferManifestRef.current = null;
+    sentHashesRef.current.clear();
+
+    const agTransport = new AirGappedTransport();
+    transportRef.current = agTransport;
+    airGappedTransportRef.current = agTransport;
+    transportCleanupRef.current = setupTransportListeners(agTransport, 'SENDER');
+
+    setAirGappedRole('SENDER');
+    setIsAirGappedModalOpen(true);
+  };
+
+  const handleStartAirGappedReceive = async () => {
+    transportCleanupRef.current?.();
+    transportCleanupRef.current = null;
+    transportRef.current?.close();
+
+    const tempSessionId = generateSecureId('ses');
+    setRoomId(tempSessionId);
+    setRole('RECEIVER');
+    setMode('QR_MANUAL');
+    setConnectionState('CONNECTING');
+
+    activeManifestRef.current = null;
+    activeTransferManifestRef.current = null;
+    sentHashesRef.current.clear();
+
+    const agTransport = new AirGappedTransport();
+    transportRef.current = agTransport;
+    airGappedTransportRef.current = agTransport;
+    transportCleanupRef.current = setupTransportListeners(agTransport, 'RECEIVER');
+
+    setAirGappedRole('RECEIVER');
+    setIsAirGappedModalOpen(true);
+  };
+
+  const setupTransportListeners = (webrtc: WebRtcTransport | AirGappedTransport, currentRole: 'SENDER' | 'RECEIVER'): (() => void) => {
     const unsubs: (() => void)[] = [];
 
     unsubs.push(
       webrtc.subscribe('onConnectionStateChange', (state: any, reason?: any) => {
+        // Guard: If transfer was already completed and verified, losing signaling or peer connection
+        // (such as when disabling internet or moving away) must NOT erase the completed files view!
+        if (useConnectionStore.getState().connectionState === 'COMPLETED' && state === 'DISCONNECTED') {
+          console.log('Peer disconnected after transfer completion. Preserving COMPLETED state.');
+          return;
+        }
         setConnectionState(state, reason);
       })
     );
@@ -213,6 +327,7 @@ export const Home: React.FC = () => {
         // DataChannel is open! Sender dispatches transfer manifest
         if (currentRole === 'SENDER' && selectedFiles.length > 0) {
           setIsQrModalOpen(false);
+          setIsAirGappedModalOpen(false);
 
           // Generate manifest EXACTLY ONCE for this transfer session
           let manifest = activeManifestRef.current;
@@ -248,6 +363,7 @@ export const Home: React.FC = () => {
         if (response.accepted) {
           setConnectionState('TRANSFERRING');
           setIsQrModalOpen(false);
+          setIsAirGappedModalOpen(false);
 
           // Sender: stream chunks using the STABLE manifest instance created earlier
           if (currentRole === 'SENDER' && selectedFiles.length > 0) {
@@ -335,7 +451,9 @@ export const Home: React.FC = () => {
                 }
               }
 
+              webrtc.setCompleted?.();
               setConnectionState('COMPLETED');
+              refreshSavedFiles();
             }
           }
         } catch (err: any) {
@@ -379,6 +497,7 @@ export const Home: React.FC = () => {
             });
           }
 
+          webrtc.setCompleted?.();
           setConnectionState('COMPLETED');
         }
       })
@@ -484,6 +603,8 @@ export const Home: React.FC = () => {
     activeTransferManifestRef.current = null;
     sentHashesRef.current.clear();
     setIsQrModalOpen(false);
+    setIsAirGappedModalOpen(false);
+    airGappedTransportRef.current = null;
 
     // Revoke any blob URLs safely before store reset
     completedFiles.forEach((f) => {
@@ -497,6 +618,7 @@ export const Home: React.FC = () => {
     resetConnection();
     resetTransfer();
     transferEngine.cancel();
+    refreshSavedFiles();
 
     // Clean URL query if in join mode
     if (typeof window !== 'undefined' && (window.location.search || window.location.hash)) {
@@ -506,7 +628,11 @@ export const Home: React.FC = () => {
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors">
-      <Navbar onOpenHelp={() => setIsHelpOpen(true)} />
+      <Navbar
+        onOpenHelp={() => setIsHelpOpen(true)}
+        onOpenSavedFiles={() => setIsSavedFilesOpen(true)}
+        savedFilesCount={savedFiles.length}
+      />
 
       <main className="flex-1 max-w-4xl w-full mx-auto px-4 sm:px-6 py-8 flex flex-col items-center">
         {/* Receiver Waiting Banner (shown when receiver opens QR code join link) */}
@@ -579,8 +705,23 @@ export const Home: React.FC = () => {
         <ActionCards
           onFindNearby={handleStartSharing}
           onShareWithBrowser={handleStartSharing}
+          onAirGappedShare={handleStartAirGappedShare}
+          onAirGappedReceive={handleStartAirGappedReceive}
         />
       </main>
+
+      {/* Air-Gapped 100% Offline QR Modal */}
+      <AirGappedModal
+        isOpen={isAirGappedModalOpen}
+        onClose={() => setIsAirGappedModalOpen(false)}
+        role={airGappedRole}
+        transport={airGappedTransportRef.current}
+        sessionId={useConnectionStore.getState().roomId || 'qrses'}
+        onSessionReady={(newRole, newSessionId) => {
+          setRole(newRole);
+          setRoomId(newSessionId);
+        }}
+      />
 
       {/* QR Code Modal for Sender */}
       <QrModal
@@ -615,6 +756,14 @@ export const Home: React.FC = () => {
       <ArchitectureHelpModal
         isOpen={isHelpOpen}
         onClose={() => setIsHelpOpen(false)}
+      />
+
+      {/* Persistent Offline Received Files Drawer */}
+      <ReceivedFilesDrawer
+        isOpen={isSavedFilesOpen}
+        onClose={() => setIsSavedFilesOpen(false)}
+        savedFiles={savedFiles}
+        onRefresh={refreshSavedFiles}
       />
 
       {/* Footer */}

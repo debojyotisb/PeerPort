@@ -1,13 +1,15 @@
 import React from 'react';
-import { Zap, Sun, Moon, Laptop, ShieldCheck, Wifi, HelpCircle } from 'lucide-react';
+import { Zap, Sun, Moon, Laptop, ShieldCheck, Wifi, HelpCircle, HardDrive } from 'lucide-react';
 import { useThemeStore } from '../state/theme-store.js';
 import { useConnectionStore } from '../state/connection-store.js';
 
 interface NavbarProps {
   onOpenHelp?: () => void;
+  onOpenSavedFiles?: () => void;
+  savedFilesCount?: number;
 }
 
-export const Navbar: React.FC<NavbarProps> = ({ onOpenHelp }) => {
+export const Navbar: React.FC<NavbarProps> = ({ onOpenHelp, onOpenSavedFiles, savedFilesCount = 0 }) => {
   const { mode, effectiveTheme, toggleTheme } = useThemeStore();
   const { connectionState, mode: transportMode, isRelayActive } = useConnectionStore();
 
@@ -60,6 +62,23 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenHelp }) => {
         {/* Right tools */}
         <div className="flex items-center gap-3">
           {getStatusBadge()}
+
+          {/* Saved Files Drawer Trigger */}
+          {onOpenSavedFiles && (
+            <button
+              onClick={onOpenSavedFiles}
+              aria-label="View saved files in storage"
+              title="Saved Files (Offline Storage)"
+              className="relative p-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+            >
+              <HardDrive className="w-4 h-4 text-sky-500" />
+              {savedFilesCount > 0 && (
+                <span className="absolute -top-1 -right-1 px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-sky-500 text-slate-950">
+                  {savedFilesCount}
+                </span>
+              )}
+            </button>
+          )}
 
           {/* Theme toggle */}
           <button

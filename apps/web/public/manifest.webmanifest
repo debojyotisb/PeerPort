@@ -1,0 +1,20 @@
+{
+  "name": "PeerPort - Offline & Direct File Sharing",
+  "short_name": "PeerPort",
+  "description": "Cross-platform peer-to-peer file sharing between Android, iOS, and PC with zero cloud uploads.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "icons": [
+    {
+      "src": "/lightning.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
+

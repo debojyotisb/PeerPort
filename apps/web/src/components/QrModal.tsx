@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
-import { X, Copy, Check, Globe, Loader2, UserCheck, ShieldCheck } from 'lucide-react';
+import { X, Copy, Check, Globe, Loader2, UserCheck, ShieldCheck, Wifi, Settings2 } from 'lucide-react';
 import { useConnectionStore } from '../state/connection-store.js';
 
 interface QrModalProps {
@@ -14,11 +14,39 @@ export const QrModal: React.FC<QrModalProps> = ({ isOpen, onClose, onJoinRoom })
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copied, setCopied] = useState(false);
   const [manualCode, setManualCode] = useState('');
+  const [showNetworkConfig, setShowNetworkConfig] = useState(false);
+  const [localIp, setLocalIp] = useState(() => {
+    if (typeof localStorage !== 'undefined') {
+      return localStorage.getItem('peerport_local_ip') || '';
+    }
+    return '';
+  });
 
-  // The actual joining URL that the receiver's camera scans
-  const joiningUrl = typeof window !== 'undefined'
-    ? `${window.location.origin}/?join=${roomId || ''}`
-    : `https://peerport.app/?join=${roomId || ''}`;
+  const isLocalhost = typeof window !== 'undefined' && (
+    window.location.hostname === 'localhost' ||
+    window.location.hostname === '127.0.0.1'
+  );
+
+  // Compute joining URL based on online vs local hotspot network
+  const getJoiningUrl = () => {
+    if (typeof window === 'undefined') return `https://peerport.app/?join=${roomId || ''}`;
+
+    if (localIp.trim()) {
+      const port = window.location.port ? `:${window.location.port}` : '';
+      return `http://${localIp.trim()}${port}/?join=${roomId || ''}&signal=ws://${localIp.trim()}:8088`;
+    }
+
+    return `${window.location.origin}/?join=${roomId || ''}`;
+  };
+
+  const joiningUrl = getJoiningUrl();
+
+  const handleIpChange = (newIp: string) => {
+    setLocalIp(newIp);
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('peerport_local_ip', newIp);
+    }
+  };
 
   useEffect(() => {
     if (!isOpen || !roomId) return;
@@ -97,6 +125,38 @@ export const QrModal: React.FC<QrModalProps> = ({ isOpen, onClose, onJoinRoom })
 
           {/* Copy Joining URL */}
           <div className="w-full text-center">
+            {/* Hotspot / Offline Local Network Option */}
+            <div className="mb-3 text-left">
+              <div className="flex items-center justify-between mb-1.5">
+                <button
+                  type="button"
+                  onClick={() => setShowNetworkConfig(!showNetworkConfig)}
+                  className="text-[11px] font-semibold text-sky-600 dark:text-sky-400 hover:underline flex items-center gap-1"
+                >
+                  <Wifi className="w-3.5 h-3.5" />
+                  <span>{localIp ? `Hotspot IP: ${localIp}` : 'Phone Hotspot / Offline Wi-Fi settings'}</span>
+                </button>
+              </div>
+
+              {(showNetworkConfig || isLocalhost) && (
+                <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700/70 mb-2.5 animate-fade-in">
+                  <label className="block text-[10px] font-medium text-slate-500 dark:text-slate-400 mb-1">
+                    Laptop Wi-Fi / Hotspot IP (e.g. 192.168.43.100 or 192.168.1.x):
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. 192.168.43.150"
+                    value={localIp}
+                    onChange={(e) => handleIpChange(e.target.value)}
+                    className="w-full px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:border-sky-500"
+                  />
+                  <p className="text-[10px] text-slate-400 mt-1">
+                    Entering your laptop's local IP enables mobile phones to load PeerPort and connect offline without internet.
+                  </p>
+                </div>
+              )}
+            </div>
+
             <div className="flex items-center gap-2 mb-3">
               <input
                 type="text"

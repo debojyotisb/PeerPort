@@ -16,6 +16,7 @@ import {
 import { createFileMetadata } from './file-selection.js';
 import { getLocalDeviceInfo, generateSecureId } from './device-info.js';
 import { CompletedFileRecord } from '../state/transfer-store.js';
+import { offlineStorage } from './offline-storage.js';
 
 export class TransferEngine {
   private isCancelled = false;
@@ -228,6 +229,27 @@ export class TransferEngine {
 
       // Mark file as completed only after successful assembly and verification
       this.completedFileIds.add(fileMeta.id);
+
+      // Free chunk memory for this file immediately after assembling blob to prevent memory explosion
+      chunksMap.clear();
+      this.fileChunks.delete(fileMeta.id);
+
+      // Auto-persist verified file into IndexedDB so it survives disconnections and offline reloads
+      try {
+        await offlineStorage.saveReceivedFile({
+          id: fileMeta.id,
+          transferId: this.activeManifest.transferId,
+          name: fileMeta.name,
+          size: blob.size,
+          mimeType: fileMeta.mimeType,
+          sha256,
+          blob,
+          verified: true,
+          receivedAt: Date.now()
+        });
+      } catch (storageErr) {
+        console.warn('Failed to auto-persist received file to IndexedDB:', storageErr);
+      }
 
       return {
         id: fileMeta.id,

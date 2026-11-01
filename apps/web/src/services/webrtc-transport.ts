@@ -26,6 +26,9 @@ export class WebRtcTransport implements PeerTransport {
   private signalingUrl: string;
   private iceServers: RTCIceServer[];
   private pendingIceCandidates: RTCIceCandidateInit[] = [];
+  private lastProcessedOfferId: string | null = null;
+  private lastProcessedResponseId: string | null = null;
+  private lastProcessedCompleteId: string | null = null;
 
   private listeners = {
     onPeerFound: new Set<(peer: DiscoveredPeer) => void>(),
@@ -102,6 +105,12 @@ export class WebRtcTransport implements PeerTransport {
       };
 
       this.ws.onclose = () => {
+        // If DataChannel is already established and open, losing signaling WebSocket does not disconnect P2P transfer!
+        if (this.dataChannel && this.dataChannel.readyState === 'open') {
+          console.warn('Signaling WebSocket closed, but WebRTC DataChannel remains active.');
+          return;
+        }
+
         if (this.connectionState !== 'COMPLETED' && this.connectionState !== 'IDLE') {
           this.updateState('DISCONNECTED', 'Signaling connection closed');
         }
@@ -178,7 +187,7 @@ export class WebRtcTransport implements PeerTransport {
     this.updateState('AWAITING_APPROVAL');
     const localDevice = getLocalDeviceInfo();
 
-    this.sendSignal({
+    this.sendControlMessage({
       type: 'TRANSFER_OFFER',
       roomId: this.currentRoomId || 'default',
       senderId: localDevice.deviceId,
@@ -192,7 +201,7 @@ export class WebRtcTransport implements PeerTransport {
     const localDevice = getLocalDeviceInfo();
     const type = accepted ? 'TRANSFER_ACCEPT' : 'TRANSFER_REJECT';
 
-    this.sendSignal({
+    this.sendControlMessage({
       type,
       roomId: this.currentRoomId || 'default',
       senderId: localDevice.deviceId,
@@ -231,7 +240,7 @@ export class WebRtcTransport implements PeerTransport {
 
   async cancelTransfer(connection: PeerConnection, transferId: string): Promise<void> {
     const localDevice = getLocalDeviceInfo();
-    this.sendSignal({
+    this.sendControlMessage({
       type: 'TRANSFER_CANCEL',
       roomId: this.currentRoomId || 'default',
       senderId: localDevice.deviceId,
@@ -243,8 +252,9 @@ export class WebRtcTransport implements PeerTransport {
   }
 
   async sendTransferComplete(connection: PeerConnection, payload: TransferCompletePayload): Promise<void> {
+    this.updateState('COMPLETED');
     const localDevice = getLocalDeviceInfo();
-    this.sendSignal({
+    this.sendControlMessage({
       type: 'TRANSFER_COMPLETE',
       roomId: this.currentRoomId || 'default',
       senderId: localDevice.deviceId,
@@ -252,6 +262,10 @@ export class WebRtcTransport implements PeerTransport {
       payload,
       timestamp: Date.now()
     });
+  }
+
+  setCompleted(): void {
+    this.updateState('COMPLETED');
   }
 
   clearListeners(): void {
@@ -284,12 +298,37 @@ export class WebRtcTransport implements PeerTransport {
       this.ws = null;
     }
     this.pendingIceCandidates = [];
+    this.lastProcessedOfferId = null;
+    this.lastProcessedResponseId = null;
+    this.lastProcessedCompleteId = null;
     this.updateState('IDLE');
   }
 
   private sendSignal(msg: SignalingMessage<any>) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
+    }
+  }
+
+  private sendControlMessage(msg: SignalingMessage<any>) {
+    const raw = JSON.stringify(msg);
+
+    // 1. If WebRTC DataChannel is open, dispatch control message directly peer-to-peer!
+    if (this.dataChannel && this.dataChannel.readyState === 'open') {
+      try {
+        this.dataChannel.send(raw);
+      } catch (dcErr) {
+        console.warn('Failed to send control frame over DataChannel:', dcErr);
+      }
+    }
+
+    // 2. Also send over WebSocket signaling as fallback/dual-delivery if active
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(raw);
+      } catch (wsErr) {
+        console.warn('Failed to send signal over WebSocket:', wsErr);
+      }
     }
   }
 
@@ -320,7 +359,10 @@ export class WebRtcTransport implements PeerTransport {
       if (state === 'connected') {
         // Direct peer connection established
       } else if (state === 'failed' || state === 'disconnected') {
-        this.updateState('DISCONNECTED', `WebRTC state: ${state}`);
+        // Guard: Never overwrite COMPLETED state if transfer was already received & verified!
+        if (this.connectionState !== 'COMPLETED') {
+          this.updateState('DISCONNECTED', `WebRTC state: ${state}`);
+        }
       }
     };
   }
@@ -348,6 +390,17 @@ export class WebRtcTransport implements PeerTransport {
     };
 
     channel.onmessage = (event) => {
+      // Direct DataChannel control signaling (works without WebSocket or internet)
+      if (typeof event.data === 'string') {
+        try {
+          const msg = JSON.parse(event.data) as SignalingMessage<any>;
+          this.handleSignalingMessage(msg);
+        } catch (err) {
+          console.error('Failed to parse control frame on DataChannel:', err);
+        }
+        return;
+      }
+
       try {
         const decoded = decodeChunk(event.data);
         if (decoded.header.messageType === ChunkMessageType.DATA) {
@@ -475,6 +528,11 @@ export class WebRtcTransport implements PeerTransport {
       case 'TRANSFER_OFFER': {
         const payload = msg.payload as any;
         const manifest = payload.manifest as TransferManifest;
+
+        // Deduplicate offer if delivered by both DataChannel and WebSocket
+        if (this.lastProcessedOfferId === manifest.transferId) break;
+        this.lastProcessedOfferId = manifest.transferId;
+
         this.updateState('AWAITING_APPROVAL');
 
         for (const l of this.listeners.onTransferRequest) {
@@ -490,8 +548,13 @@ export class WebRtcTransport implements PeerTransport {
       }
 
       case 'TRANSFER_ACCEPT': {
-        this.updateState('TRANSFERRING');
         const payload = msg.payload as any;
+
+        // Deduplicate accept if delivered by both DataChannel and WebSocket
+        if (this.lastProcessedResponseId === payload.transferId) break;
+        this.lastProcessedResponseId = payload.transferId;
+
+        this.updateState('TRANSFERRING');
         for (const l of this.listeners.onTransferResponse) {
           l({
             transferId: payload.transferId,
@@ -503,8 +566,12 @@ export class WebRtcTransport implements PeerTransport {
       }
 
       case 'TRANSFER_REJECT': {
-        this.updateState('REJECTED');
         const payload = msg.payload as any;
+
+        if (this.lastProcessedResponseId === payload.transferId) break;
+        this.lastProcessedResponseId = payload.transferId;
+
+        this.updateState('REJECTED');
         for (const l of this.listeners.onTransferResponse) {
           l({
             transferId: payload.transferId,
@@ -523,6 +590,12 @@ export class WebRtcTransport implements PeerTransport {
 
       case 'TRANSFER_COMPLETE': {
         const payload = msg.payload as TransferCompletePayload;
+
+        // Deduplicate completion ack if delivered by both DataChannel and WebSocket
+        if (this.lastProcessedCompleteId === payload.transferId) break;
+        this.lastProcessedCompleteId = payload.transferId;
+
+        this.updateState('COMPLETED');
         for (const l of this.listeners.onTransferComplete) {
           l(payload);
         }
