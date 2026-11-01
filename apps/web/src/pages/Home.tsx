@@ -38,6 +38,7 @@ export const Home: React.FC = () => {
     incomingManifest,
     progress,
     completedFiles,
+    addFiles,
     setOutgoingManifest,
     setIncomingManifest,
     setProgress,
@@ -77,6 +78,21 @@ export const Home: React.FC = () => {
   const sentHashesRef = useRef<Map<string, string>>(new Map());
   const ackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transportCleanupRef = useRef<(() => void) | null>(null);
+  const sendFileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleSendFilesClick = () => {
+    if (selectedFiles.length > 0) {
+      handleStartAirGappedShare();
+    } else {
+      sendFileInputRef.current?.click();
+    }
+  };
+
+  const handleSendFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      addFiles(Array.from(e.target.files));
+    }
+  };
 
   // Sync incomingManifest ref
   useEffect(() => {
@@ -701,12 +717,28 @@ export const Home: React.FC = () => {
           <FileDropzone />
         </div>
 
-        {/* Action Cards */}
+        {/* Action Cards (Quick Share Inspired Hub) */}
         <ActionCards
-          onFindNearby={handleStartSharing}
-          onShareWithBrowser={handleStartSharing}
-          onAirGappedShare={handleStartAirGappedShare}
-          onAirGappedReceive={handleStartAirGappedReceive}
+          onSendFiles={handleSendFilesClick}
+          onReceiveFiles={handleStartAirGappedReceive}
+          onOfflineQrHub={() => {
+            if (selectedFiles.length > 0) {
+              handleStartAirGappedShare();
+            } else {
+              handleStartAirGappedReceive();
+            }
+          }}
+          onOpenSavedFiles={() => setIsSavedFilesOpen(true)}
+          savedFilesCount={savedFiles.length}
+          onOnlineShare={handleStartSharing}
+        />
+
+        <input
+          type="file"
+          ref={sendFileInputRef}
+          onChange={handleSendFileInputChange}
+          multiple
+          className="hidden"
         />
       </main>
 
@@ -720,6 +752,13 @@ export const Home: React.FC = () => {
         onSessionReady={(newRole, newSessionId) => {
           setRole(newRole);
           setRoomId(newSessionId);
+        }}
+        onRetry={() => {
+          if (airGappedRole === 'SENDER') {
+            handleStartAirGappedShare();
+          } else {
+            handleStartAirGappedReceive();
+          }
         }}
       />
 

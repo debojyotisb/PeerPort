@@ -15,7 +15,9 @@ import {
   Clipboard,
   ShieldCheck,
   Eye,
-  CameraOff
+  CameraOff,
+  WifiOff,
+  HelpCircle
 } from 'lucide-react';
 import { AirGappedTransport } from '../services/air-gapped-transport.js';
 import {
@@ -23,6 +25,20 @@ import {
   QrPayloadReassembler,
   parseAndValidateQrPayload
 } from '../services/qr-signaling.js';
+import { generateSecureId } from '../services/device-info.js';
+
+export type AirGappedPhase =
+  | 'INITIALIZING'
+  | 'CREATING_OFFER'
+  | 'GENERATING_QR'
+  | 'WAITING_FOR_RECEIVER'
+  | 'SCANNING_ANSWER'
+  | 'SCANNING_OFFER'
+  | 'GENERATING_ANSWER'
+  | 'WAITING_FOR_SENDER'
+  | 'CONNECTING'
+  | 'CONNECTED'
+  | 'FAILED';
 
 interface AirGappedModalProps {
   isOpen: boolean;
@@ -31,6 +47,7 @@ interface AirGappedModalProps {
   transport: AirGappedTransport | null;
   sessionId: string;
   onSessionReady?: (role: 'SENDER' | 'RECEIVER', sessionId: string) => void;
+  onRetry?: () => void;
 }
 
 export const AirGappedModal: React.FC<AirGappedModalProps> = ({
@@ -39,18 +56,19 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
   role: initialRole,
   transport,
   sessionId,
-  onSessionReady
+  onSessionReady,
+  onRetry
 }) => {
   const [role, setRole] = useState<'SENDER' | 'RECEIVER'>(initialRole);
-  const [step, setStep] = useState<'OFFER_QR' | 'SCAN_ANSWER' | 'SCAN_OFFER' | 'ANSWER_QR'>('OFFER_QR');
+  const [phase, setPhase] = useState<AirGappedPhase>('INITIALIZING');
+  const [statusMessage, setStatusMessage] = useState<string>('');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // QR display state
   const [packets, setPackets] = useState<QrSignalingPacket[]>([]);
   const [activeFrameIndex, setActiveFrameIndex] = useState(0);
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [autoCycle, setAutoCycle] = useState(true);
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [generationError, setGenerationError] = useState<string | null>(null);
 
   // Scanner state
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -64,61 +82,109 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
   const reassemblerRef = useRef<QrPayloadReassembler>(new QrPayloadReassembler());
   const scanIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Synchronize initial role when modal opens
+  // Initialize role and workflow when modal opens
   useEffect(() => {
     if (isOpen) {
       setRole(initialRole);
-      setStep(initialRole === 'SENDER' ? 'OFFER_QR' : 'SCAN_OFFER');
-      setPackets([]);
-      setActiveFrameIndex(0);
-      setQrDataUrl('');
-      setGenerationError(null);
+      setErrorMessage(null);
       setCameraError(null);
       setManualError(null);
       setManualPayloadText('');
+      setPackets([]);
+      setActiveFrameIndex(0);
+      setQrDataUrl('');
       reassemblerRef.current.reset();
-    } else {
-      stopCamera();
-    }
-  }, [isOpen, initialRole]);
 
-  // Clean up camera on unmount
+      if (initialRole === 'SENDER') {
+        startSenderOffer();
+      } else {
+        setPhase('SCANNING_OFFER');
+        setStatusMessage('Point camera at the Offer QR code on the sender device.');
+      }
+    } else {
+      cleanup();
+    }
+  }, [isOpen, initialRole, sessionId]);
+
+  // Clean up on component unmount
   useEffect(() => {
     return () => {
-      stopCamera();
+      cleanup();
     };
   }, []);
 
-  // Generate Sender Offer when in OFFER_QR step
+  const cleanup = () => {
+    stopCamera();
+    if (autoCloseTimerRef.current) {
+      clearTimeout(autoCloseTimerRef.current);
+      autoCloseTimerRef.current = null;
+    }
+  };
+
+  // Subscribe to transport connection lifecycle
   useEffect(() => {
-    if (!isOpen || !transport || role !== 'SENDER' || step !== 'OFFER_QR') return;
+    if (!transport || !isOpen) return;
 
-    let isMounted = true;
-    setIsGenerating(true);
-    setGenerationError(null);
+    const unsubs: (() => void)[] = [];
 
-    transport
-      .createOfferPayloads(sessionId)
-      .then((generatedPackets) => {
-        if (!isMounted) return;
-        setPackets(generatedPackets);
-        setActiveFrameIndex(0);
-        setIsGenerating(false);
+    // Triggered when DataChannel transitions to 'open'
+    unsubs.push(
+      transport.subscribe('onChannelReady', () => {
+        setPhase('CONNECTED');
+        setStatusMessage('Direct P2P DataChannel connected! Preparing file transfer...');
+        stopCamera();
+
+        // Automatically dismiss modal after 800ms to allow transfer to start cleanly
+        if (autoCloseTimerRef.current) clearTimeout(autoCloseTimerRef.current);
+        autoCloseTimerRef.current = setTimeout(() => {
+          onClose();
+        }, 800);
       })
-      .catch((err) => {
-        if (!isMounted) return;
-        console.error('Failed to generate air-gapped offer:', err);
-        setGenerationError(err.message || 'Could not generate offer');
-        setIsGenerating(false);
-      });
+    );
+
+    // Triggered on connection state transitions
+    unsubs.push(
+      transport.subscribe('onConnectionStateChange', (state: any, reason?: string) => {
+        if (state === 'FAILED') {
+          setPhase('FAILED');
+          setErrorMessage(reason || 'Failed to establish direct peer connection. Check local network.');
+          stopCamera();
+        } else if (state === 'CONNECTING' && phase !== 'CONNECTED') {
+          setPhase('CONNECTING');
+          setStatusMessage('Negotiating direct WebRTC link over local network...');
+        }
+      })
+    );
 
     return () => {
-      isMounted = false;
+      unsubs.forEach((u) => u());
     };
-  }, [isOpen, transport, role, step, sessionId]);
+  }, [transport, isOpen, phase, onClose]);
 
-  // Render QR code whenever active packet changes
+  // Sender: generate Offer payloads
+  const startSenderOffer = async () => {
+    if (!transport) return;
+    setPhase('CREATING_OFFER');
+    setStatusMessage('Generating local WebRTC offer with host candidates...');
+    setErrorMessage(null);
+
+    try {
+      setPhase('GENERATING_QR');
+      const generatedPackets = await transport.createOfferPayloads(sessionId);
+      setPackets(generatedPackets);
+      setActiveFrameIndex(0);
+      setPhase('WAITING_FOR_RECEIVER');
+      setStatusMessage('Show this Offer QR code to the receiver.');
+    } catch (err: any) {
+      console.error('Failed to create offer payloads:', err);
+      setPhase('FAILED');
+      setErrorMessage(err.message || 'Failed to gather local network addresses. Ensure Wi-Fi or hotspot is active.');
+    }
+  };
+
+  // Render QR image whenever packets or active frame changes
   useEffect(() => {
     if (packets.length === 0) {
       setQrDataUrl('');
@@ -139,38 +205,37 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
       }
     })
       .then((url) => setQrDataUrl(url))
-      .catch((err) => console.error('Error rendering QR image:', err));
+      .catch((err) => console.error('Error generating QR image:', err));
   }, [packets, activeFrameIndex]);
 
   // Multi-frame QR auto-cycling
   useEffect(() => {
-    if (packets.length <= 1 || !autoCycle || (step !== 'OFFER_QR' && step !== 'ANSWER_QR')) {
-      return;
-    }
+    const isShowingQr = phase === 'WAITING_FOR_RECEIVER' || phase === 'WAITING_FOR_SENDER';
+    if (packets.length <= 1 || !autoCycle || !isShowingQr) return;
 
     const timer = setInterval(() => {
       setActiveFrameIndex((prev) => (prev + 1) % packets.length);
     }, 2000);
 
     return () => clearInterval(timer);
-  }, [packets.length, autoCycle, step]);
+  }, [packets.length, autoCycle, phase]);
 
-  // Manage camera streaming for scanner steps
+  // Camera management for scanning phases
   useEffect(() => {
-    const isScanningStep = step === 'SCAN_ANSWER' || step === 'SCAN_OFFER';
-    if (isOpen && isScanningStep) {
+    const isScanning = phase === 'SCANNING_OFFER' || phase === 'SCANNING_ANSWER';
+    if (isOpen && isScanning) {
       startCamera();
     } else {
       stopCamera();
     }
-  }, [isOpen, step]);
+  }, [isOpen, phase]);
 
   const startCamera = async () => {
     stopCamera();
     setCameraError(null);
 
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-      setCameraError('Camera access is not supported in this browser. Please use manual payload entry.');
+      setCameraError('Camera access not supported in this browser. Use manual payload entry below.');
       return;
     }
 
@@ -187,8 +252,8 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
       setCameraActive(true);
       startBarcodeDetection();
     } catch (err: any) {
-      console.warn('Camera permission denied or camera unavailable:', err);
-      setCameraError(err.message || 'Camera permission denied or camera unavailable. Use manual payload entry.');
+      console.warn('Camera access denied or failed:', err);
+      setCameraError('Camera access unavailable. Use manual payload entry below.');
       setCameraActive(false);
     }
   };
@@ -206,11 +271,8 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
   };
 
   const startBarcodeDetection = () => {
-    if (scanIntervalRef.current) {
-      clearInterval(scanIntervalRef.current);
-    }
+    if (scanIntervalRef.current) clearInterval(scanIntervalRef.current);
 
-    // Check if native BarcodeDetector API is available
     if (typeof window !== 'undefined' && 'BarcodeDetector' in window) {
       try {
         const detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
@@ -219,21 +281,19 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
           try {
             const barcodes = await detector.detect(videoRef.current);
             if (barcodes.length > 0) {
-              const rawText = barcodes[0].rawValue;
-              handleScannedPayload(rawText);
+              handleScannedPayload(barcodes[0].rawValue);
             }
           } catch {
-            // Frame processing error, ignore and continue next tick
+            // Transient frame processing error, ignore
           }
         }, 250);
         return;
       } catch (err) {
-        console.warn('Failed to initialize native BarcodeDetector:', err);
+        console.warn('BarcodeDetector initialization failed:', err);
       }
     }
 
-    // Fallback: If BarcodeDetector is not natively supported, prompt user for manual paste
-    setCameraError('Native QR scanning is unavailable in this browser. Use manual payload entry below.');
+    setCameraError('Native QR scanner unavailable in this browser. Use manual payload entry below.');
   };
 
   const handleScannedPayload = async (rawText: string) => {
@@ -247,34 +307,36 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
       if (result) {
         stopCamera();
+
         if (role === 'SENDER' && result.type === 'answer') {
-          // Sender received completed answer
+          // Sender received answer -> Connecting
+          setPhase('CONNECTING');
+          setStatusMessage('Applying remote answer and establishing connection...');
           if (transport) {
             await transport.applyAnswer(result.sdp);
-            onClose();
           }
         } else if (role === 'RECEIVER' && result.type === 'offer') {
-          // Receiver received completed offer, generate answer
-          setIsGenerating(true);
-          setGenerationError(null);
+          // Receiver received offer -> Generating Answer
+          setPhase('GENERATING_ANSWER');
+          setStatusMessage('Processing offer and generating local answer...');
           if (transport) {
             onSessionReady?.('RECEIVER', result.sessionId);
             const answerPackets = await transport.createAnswerPayloads(result.sessionId, result.sdp);
             setPackets(answerPackets);
             setActiveFrameIndex(0);
-            setIsGenerating(false);
-            setStep('ANSWER_QR');
+            setPhase('WAITING_FOR_SENDER');
+            setStatusMessage('Show this Answer QR code to the sender to finalize the link.');
           }
         }
       }
     } catch (err: any) {
-      setManualError(err.message || 'Invalid or incompatible QR packet');
+      setManualError(err.message || 'Invalid QR payload format');
     }
   };
 
   const handleManualSubmit = () => {
     if (!manualPayloadText.trim()) {
-      setManualError('Please paste the payload text first.');
+      setManualError('Please paste the payload JSON text first.');
       return;
     }
     setManualError(null);
@@ -287,6 +349,30 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     navigator.clipboard.writeText(JSON.stringify(current));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleRetry = () => {
+    cleanup();
+    setErrorMessage(null);
+    setManualError(null);
+    setManualPayloadText('');
+    reassemblerRef.current.reset();
+
+    if (onRetry) {
+      onRetry();
+      return;
+    }
+
+    // Default self-contained retry
+    const newSessionId = generateSecureId('ses');
+    onSessionReady?.(role, newSessionId);
+
+    if (role === 'SENDER') {
+      startSenderOffer();
+    } else {
+      setPhase('SCANNING_OFFER');
+      setStatusMessage('Point camera at the Offer QR code on the sender device.');
+    }
   };
 
   if (!isOpen) return null;
@@ -304,49 +390,116 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
         {/* Header */}
         <div className="mb-4">
           <div className="flex items-center gap-2 mb-1">
-            <span className="p-1.5 rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-400">
+            <span className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
               <QrCode className="w-5 h-5" />
             </span>
             <h3 className="text-xl font-bold text-slate-900 dark:text-white">
-              Air-Gapped QR Transfer
+              Air-Gapped Offline Transfer
             </h3>
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Completely serverless connection between phones. No internet, Wi-Fi router, or signaling server required.
+            100% serverless peer-to-peer WebRTC. No internet, router, or external servers required.
           </p>
         </div>
 
-        {/* Step Indicator */}
+        {/* Connection Phase / Status Pill */}
         <div className="flex items-center justify-between p-2.5 rounded-xl bg-slate-100 dark:bg-slate-800/60 mb-5 text-xs font-semibold">
-          <span className={role === 'SENDER' && step === 'OFFER_QR' ? 'text-sky-600 dark:text-sky-400 font-bold' : 'text-slate-500'}>
-            1. Offer QR
-          </span>
-          <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
-          <span className={step === 'SCAN_OFFER' || step === 'ANSWER_QR' ? 'text-sky-600 dark:text-sky-400 font-bold' : 'text-slate-500'}>
-            2. Receiver Answer
-          </span>
-          <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
-          <span className={step === 'SCAN_ANSWER' ? 'text-sky-600 dark:text-sky-400 font-bold' : 'text-slate-500'}>
-            3. Finalize Link
+          <div className="flex items-center gap-2">
+            {phase === 'CONNECTED' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-500 animate-bounce" />
+            ) : phase === 'FAILED' ? (
+              <AlertCircle className="w-4 h-4 text-rose-500" />
+            ) : (
+              <Loader2 className="w-4 h-4 text-sky-500 animate-spin" />
+            )}
+            <span className={phase === 'CONNECTED' ? 'text-emerald-600 dark:text-emerald-400 font-bold' : phase === 'FAILED' ? 'text-rose-600 font-bold' : 'text-slate-700 dark:text-slate-300'}>
+              {statusMessage || phase}
+            </span>
+          </div>
+
+          <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 font-mono uppercase">
+            {role}
           </span>
         </div>
 
-        {/* STEP 1: Sender displays Offer QR */}
-        {role === 'SENDER' && step === 'OFFER_QR' && (
-          <div className="flex flex-col items-center">
-            <div className="w-full p-3 rounded-xl bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 mb-4 text-xs text-sky-800 dark:text-sky-300">
-              <strong>Step 1:</strong> Have the receiving device open PeerPort and tap <em>"Receive via QR"</em> to scan this code.
+        {/* FAILED STATE VIEW */}
+        {phase === 'FAILED' && (
+          <div className="flex flex-col items-center py-4 text-center animate-fade-in">
+            <div className="w-14 h-14 rounded-2xl bg-rose-500/10 text-rose-500 flex items-center justify-center mb-3">
+              <AlertCircle className="w-8 h-8" />
+            </div>
+            <h4 className="text-base font-bold text-slate-900 dark:text-white mb-1">
+              Connection Failed
+            </h4>
+            <p className="text-xs text-rose-600 dark:text-rose-400 mb-4 max-w-sm">
+              {errorMessage || 'Unable to establish direct peer-to-peer connection.'}
+            </p>
+
+            <div className="w-full p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-left text-xs text-slate-600 dark:text-slate-400 mb-5 space-y-1.5">
+              <div className="font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-1.5 mb-1">
+                <HelpCircle className="w-3.5 h-3.5 text-sky-500" />
+                <span>Troubleshooting Checklist:</span>
+              </div>
+              <p>• Ensure both devices are connected to the same Wi-Fi network or phone hotspot.</p>
+              <p>• If using a phone hotspot, ensure mobile data is turned off if you want genuine 0% internet.</p>
+              <p>• If using a commercial Wi-Fi router, ensure AP/Client isolation is disabled.</p>
+              <p>• Ensure both QR codes were scanned completely without glare.</p>
             </div>
 
-            {isGenerating ? (
+            <button
+              type="button"
+              onClick={handleRetry}
+              className="w-full py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold transition-colors flex items-center justify-center gap-2 shadow-md shadow-sky-600/20"
+            >
+              <RefreshCw className="w-4 h-4" />
+              <span>Retry Connection</span>
+            </button>
+          </div>
+        )}
+
+        {/* CONNECTED SUCCESS VIEW */}
+        {phase === 'CONNECTED' && (
+          <div className="flex flex-col items-center py-8 text-center animate-fade-in">
+            <div className="w-16 h-16 rounded-2xl bg-emerald-500/10 text-emerald-500 flex items-center justify-center mb-3">
+              <CheckCircle2 className="w-10 h-10 animate-scale-in" />
+            </div>
+            <h4 className="text-lg font-bold text-slate-900 dark:text-white mb-1">
+              Direct P2P Link Established!
+            </h4>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              WebRTC DataChannel is open. Transitioning to file transfer...
+            </p>
+          </div>
+        )}
+
+        {/* CONNECTING IN-PROGRESS VIEW */}
+        {phase === 'CONNECTING' && (
+          <div className="flex flex-col items-center py-8 text-center animate-fade-in">
+            <Loader2 className="w-12 h-12 text-sky-500 animate-spin mb-4" />
+            <h4 className="text-base font-bold text-slate-900 dark:text-white mb-1">
+              Establishing Direct Connection
+            </h4>
+            <p className="text-xs text-slate-500 dark:text-slate-400 max-w-sm mb-4">
+              Exchanging SCTP handshake packets directly over your local Wi-Fi or hotspot. This usually takes 1-3 seconds...
+            </p>
+            <div className="flex items-center gap-1.5 text-[11px] text-emerald-600 dark:text-emerald-400 font-medium bg-emerald-50 dark:bg-emerald-950/40 px-3 py-1.5 rounded-lg border border-emerald-500/20">
+              <ShieldCheck className="w-4 h-4" />
+              <span>Zero cloud servers involved • 100% direct</span>
+            </div>
+          </div>
+        )}
+
+        {/* SENDER STEP 1: Offer QR Display */}
+        {role === 'SENDER' && (phase === 'CREATING_OFFER' || phase === 'GENERATING_QR' || phase === 'WAITING_FOR_RECEIVER') && (
+          <div className="flex flex-col items-center animate-fade-in">
+            <div className="w-full p-3 rounded-xl bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 mb-4 text-xs text-sky-800 dark:text-sky-300">
+              <strong>Step 1:</strong> On the receiving phone, tap <em>"Receive Files"</em> and scan this code with the camera.
+            </div>
+
+            {phase === 'CREATING_OFFER' || phase === 'GENERATING_QR' ? (
               <div className="w-64 h-64 flex flex-col items-center justify-center border border-dashed border-slate-300 dark:border-slate-700 rounded-2xl mb-4">
                 <Loader2 className="w-8 h-8 animate-spin text-sky-500 mb-2" />
                 <span className="text-xs text-slate-500">Compressing local SDP offer...</span>
-              </div>
-            ) : generationError ? (
-              <div className="w-full p-4 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-xs text-rose-700 dark:text-rose-300 mb-4 flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 shrink-0" />
-                <span>{generationError}</span>
               </div>
             ) : (
               <div className="p-3 bg-white rounded-2xl shadow-inner border border-slate-200 dark:border-slate-800 mb-3 flex flex-col items-center">
@@ -354,7 +507,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
               </div>
             )}
 
-            {/* Multi-frame pagination controls if SDP required chunking */}
+            {/* Multi-frame pagination controls */}
             {packets.length > 1 && (
               <div className="flex items-center gap-3 mb-3 text-xs font-medium">
                 <button
@@ -400,7 +553,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
               <button
                 type="button"
-                onClick={() => setStep('SCAN_ANSWER')}
+                onClick={() => setPhase('SCANNING_ANSWER')}
                 className="flex-1 py-2.5 px-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-md shadow-sky-600/20 transition-colors"
               >
                 <Camera className="w-4 h-4" />
@@ -410,11 +563,11 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
           </div>
         )}
 
-        {/* STEP 2: Sender scans Receiver's Answer QR */}
-        {role === 'SENDER' && step === 'SCAN_ANSWER' && (
-          <div className="flex flex-col items-center">
+        {/* SENDER STEP 2: Scanning Receiver Answer */}
+        {role === 'SENDER' && phase === 'SCANNING_ANSWER' && (
+          <div className="flex flex-col items-center animate-fade-in">
             <div className="w-full p-3 rounded-xl bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 mb-4 text-xs text-sky-800 dark:text-sky-300">
-              <strong>Step 2:</strong> Scan the Answer QR code displayed on the receiver's screen to connect.
+              <strong>Step 2:</strong> Scan the Answer QR code displayed on the receiver's screen.
             </div>
 
             {/* Video Viewport */}
@@ -437,7 +590,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
               </div>
             )}
 
-            {/* Camera error / Manual fallback input */}
+            {/* Manual fallback input */}
             {(cameraError || !cameraActive) && (
               <div className="w-full mt-2 p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700">
                 <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
@@ -469,7 +622,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
             <button
               type="button"
-              onClick={() => setStep('OFFER_QR')}
+              onClick={() => setPhase('WAITING_FOR_RECEIVER')}
               className="mt-4 text-xs text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 flex items-center gap-1 font-semibold"
             >
               <ArrowLeft className="w-3.5 h-3.5" />
@@ -478,11 +631,11 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
           </div>
         )}
 
-        {/* RECEIVER STEP 1: Scan Offer QR */}
-        {role === 'RECEIVER' && step === 'SCAN_OFFER' && (
-          <div className="flex flex-col items-center">
-            <div className="w-full p-3 rounded-xl bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 mb-4 text-xs text-sky-800 dark:text-sky-300">
-              <strong>Receiver Mode:</strong> Point your camera at the Offer QR code on the sender's phone.
+        {/* RECEIVER STEP 1: Scanning Sender Offer */}
+        {role === 'RECEIVER' && phase === 'SCANNING_OFFER' && (
+          <div className="flex flex-col items-center animate-fade-in">
+            <div className="w-full p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 mb-4 text-xs text-emerald-800 dark:text-emerald-300">
+              <strong>Step 1:</strong> Point camera at the Offer QR code displayed on the sender's screen.
             </div>
 
             {/* Video Viewport */}
@@ -538,13 +691,13 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
         )}
 
         {/* RECEIVER STEP 2: Show Answer QR */}
-        {role === 'RECEIVER' && step === 'ANSWER_QR' && (
-          <div className="flex flex-col items-center">
+        {role === 'RECEIVER' && (phase === 'GENERATING_ANSWER' || phase === 'WAITING_FOR_SENDER') && (
+          <div className="flex flex-col items-center animate-fade-in">
             <div className="w-full p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 mb-4 text-xs text-emerald-800 dark:text-emerald-300">
-              <strong>Answer Ready:</strong> Show this QR code to the sender's camera so they can finalize the link.
+              <strong>Step 2:</strong> Show this Answer QR to the sender's camera to finalize connection.
             </div>
 
-            {isGenerating ? (
+            {phase === 'GENERATING_ANSWER' ? (
               <div className="w-64 h-64 flex flex-col items-center justify-center border border-dashed border-slate-300 dark:border-slate-700 rounded-2xl mb-4">
                 <Loader2 className="w-8 h-8 animate-spin text-emerald-500 mb-2" />
                 <span className="text-xs text-slate-500">Generating local SDP answer...</span>
@@ -593,4 +746,3 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     </div>
   );
 };
-

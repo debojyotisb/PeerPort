@@ -34,6 +34,7 @@ export class AirGappedTransport implements PeerTransport {
   private lastProcessedOfferId: string | null = null;
   private lastProcessedResponseId: string | null = null;
   private lastProcessedCompleteId: string | null = null;
+  private connectionTimer: ReturnType<typeof setTimeout> | null = null;
 
   private listeners = {
     onPeerFound: new Set<(peer: DiscoveredPeer) => void>(),
@@ -89,6 +90,9 @@ export class AirGappedTransport implements PeerTransport {
     await waitForIceGathering(this.peerConnection);
 
     const sdp = this.peerConnection.localDescription?.sdp || offer.sdp || '';
+    if (!sdp.includes('candidate:')) {
+      console.warn('No local network candidates gathered. Ensure Wi-Fi or mobile hotspot is active.');
+    }
     return await createQrPayloads(sessionId, 'offer', sdp);
   }
 
@@ -106,6 +110,17 @@ export class AirGappedTransport implements PeerTransport {
     );
 
     this.notifyPeerConnected();
+
+    // Start 25s watchdog timer for DataChannel connection
+    this.clearConnectionTimer();
+    this.connectionTimer = setTimeout(() => {
+      if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+        this.updateState(
+          'FAILED',
+          'Direct connection timed out. Ensure both devices are connected to the same Wi-Fi or mobile hotspot.'
+        );
+      }
+    }, 25_000);
   }
 
   /**
@@ -132,8 +147,26 @@ export class AirGappedTransport implements PeerTransport {
 
     this.notifyPeerConnected();
 
+    // Start 45s watchdog timer for receiver awaiting sender to scan answer
+    this.clearConnectionTimer();
+    this.connectionTimer = setTimeout(() => {
+      if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+        this.updateState(
+          'FAILED',
+          'Waiting for sender timed out. Please ensure the sender scanned your Answer QR code.'
+        );
+      }
+    }, 45_000);
+
     const sdp = this.peerConnection.localDescription?.sdp || answer.sdp || '';
     return await createQrPayloads(sessionId, 'answer', sdp);
+  }
+
+  private clearConnectionTimer() {
+    if (this.connectionTimer) {
+      clearTimeout(this.connectionTimer);
+      this.connectionTimer = null;
+    }
   }
 
   private notifyPeerConnected() {
@@ -277,6 +310,7 @@ export class AirGappedTransport implements PeerTransport {
   }
 
   async close(): Promise<void> {
+    this.clearConnectionTimer();
     if (this.dataChannel) {
       try {
         this.dataChannel.close();
@@ -315,9 +349,16 @@ export class AirGappedTransport implements PeerTransport {
 
     this.peerConnection.onconnectionstatechange = () => {
       const state = this.peerConnection?.connectionState;
-      if (state === 'failed' || state === 'disconnected') {
+      if (state === 'connected') {
+        this.clearConnectionTimer();
+      } else if (state === 'failed') {
+        this.clearConnectionTimer();
         if (this.connectionState !== 'COMPLETED') {
-          this.updateState('DISCONNECTED', `Air-gapped WebRTC state: ${state}`);
+          this.updateState('FAILED', 'Direct peer link failed. Verify devices are on the same Wi-Fi or phone hotspot.');
+        }
+      } else if (state === 'disconnected') {
+        if (this.connectionState !== 'COMPLETED') {
+          this.updateState('DISCONNECTED', 'Direct peer link disconnected');
         }
       }
     };
@@ -327,6 +368,7 @@ export class AirGappedTransport implements PeerTransport {
     channel.binaryType = 'arraybuffer';
 
     channel.onopen = () => {
+      this.clearConnectionTimer();
       for (const listener of this.listeners.onChannelReady) {
         listener();
       }
