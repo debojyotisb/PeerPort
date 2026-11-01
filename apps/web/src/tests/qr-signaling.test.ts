@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import QRCode from 'qrcode';
+import jsQR from 'jsqr';
 import {
   compressSdp,
   decompressSdp,
@@ -329,6 +331,53 @@ a=rtcp-rsize`;
       const elapsed = Date.now() - start;
       expect(elapsed).toBeGreaterThanOrEqual(40);
       expect(mockPc.removeEventListener).toHaveBeenCalledWith('icegatheringstatechange', expect.any(Function));
+    });
+  });
+
+  describe('jsQR Compatibility & End-to-End Decode', () => {
+    it('successfully decodes a generated single-frame QR packet using jsQR and verifies SDP reconstruction', async () => {
+      const packets = await createQrPayloads('ses_e2e_jsqr', 'offer', MOCK_SDP);
+      expect(packets).toHaveLength(1);
+      const jsonText = JSON.stringify(packets[0]);
+
+      // Generate QR matrix
+      const qr = QRCode.create(jsonText, { errorCorrectionLevel: 'L' });
+      const size = qr.modules.size;
+      const margin = 4;
+      const scale = 4;
+      const width = (size + margin * 2) * scale;
+      const height = width;
+      const buffer = new Uint8ClampedArray(width * height * 4);
+      buffer.fill(255); // White background
+
+      for (let r = 0; r < size; r++) {
+        for (let c = 0; c < size; c++) {
+          if (qr.modules.get(r, c)) {
+            for (let dy = 0; dy < scale; dy++) {
+              for (let dx = 0; dx < scale; dx++) {
+                const x = (c + margin) * scale + dx;
+                const y = (r + margin) * scale + dy;
+                const idx = (y * width + x) * 4;
+                buffer[idx] = 0;
+                buffer[idx + 1] = 0;
+                buffer[idx + 2] = 0;
+                buffer[idx + 3] = 255;
+              }
+            }
+          }
+        }
+      }
+
+      const decoded = jsQR(buffer, width, height, { inversionAttempts: 'attemptBoth' });
+      expect(decoded).not.toBeNull();
+      expect(decoded?.data).toBe(jsonText);
+
+      // Verify that decoded QR packet validates and decompresses back to expected pruned SDP
+      const parsedPacket = parseAndValidateQrPayload(decoded!.data);
+      expect(parsedPacket.sid).toBe('ses_e2e_jsqr');
+      expect(parsedPacket.type).toBe('offer');
+      const decompressed = await decompressSdp(parsedPacket.data);
+      expect(decompressed).toBe(EXPECTED_PRUNED_SDP);
     });
   });
 });

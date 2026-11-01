@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import QRCode from 'qrcode';
+import jsQR from 'jsqr';
 import {
   X,
   QrCode,
@@ -20,7 +21,8 @@ import {
   HelpCircle,
   Play,
   Pause,
-  ScanLine
+  ScanLine,
+  Activity
 } from 'lucide-react';
 import { AirGappedTransport } from '../services/air-gapped-transport.js';
 import {
@@ -42,6 +44,46 @@ export type AirGappedPhase =
   | 'CONNECTING'
   | 'CONNECTED'
   | 'FAILED';
+
+export interface ScannerDiagnostics {
+  cameraActive: boolean;
+  cameraResolution: string;
+  decoderInit: string;
+  scanAttempts: number;
+  qrDetected: boolean;
+  qrDetectedLength: number;
+  decoderUsed: string;
+  jsonParsed: boolean;
+  packetType: string;
+  framesReceived: string;
+  payloadReassembled: boolean;
+  sdpDecompressed: boolean;
+  sdpLength: number;
+  remoteAccepted: boolean;
+  answerStarted: boolean;
+  answerRendered: boolean;
+  lastError: string | null;
+}
+
+const initialDiagnostics: ScannerDiagnostics = {
+  cameraActive: false,
+  cameraResolution: 'pending',
+  decoderInit: 'initializing...',
+  scanAttempts: 0,
+  qrDetected: false,
+  qrDetectedLength: 0,
+  decoderUsed: 'None',
+  jsonParsed: false,
+  packetType: 'none',
+  framesReceived: '0/1',
+  payloadReassembled: false,
+  sdpDecompressed: false,
+  sdpLength: 0,
+  remoteAccepted: false,
+  answerStarted: false,
+  answerRendered: false,
+  lastError: null
+};
 
 interface AirGappedModalProps {
   isOpen: boolean;
@@ -71,7 +113,8 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
   const [packets, setPackets] = useState<QrSignalingPacket[]>([]);
   const [activeFrameIndex, setActiveFrameIndex] = useState(0);
   const [cachedQrUrls, setCachedQrUrls] = useState<string[]>([]);
-  const [autoCycle, setAutoCycle] = useState(true);
+  // Prioritize ONE static QR: Auto-cycling is disabled by default!
+  const [autoCycle, setAutoCycle] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
 
   // Independent QR scanner test state
@@ -79,9 +122,15 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
   const [scannerTestResult, setScannerTestResult] = useState<string | null>(null);
   const [staticTestQrUrl, setStaticTestQrUrl] = useState<string>('');
 
-  // Scanner state
+  // Scanner state & refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const barcodeDetectorRef = useRef<any>(null);
+  const isScanningActiveRef = useRef<boolean>(false);
+  const isDecodingRef = useRef<boolean>(false);
+  const lastDecoderUsedRef = useRef<'BarcodeDetector' | 'jsQR' | 'None'>('None');
+
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [scanProgress, setScanProgress] = useState<{ received: number; total: number }>({ received: 0, total: 1 });
@@ -90,8 +139,10 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
   const [manualError, setManualError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
+  // Visible real-time scanner diagnostics
+  const [diagnostics, setDiagnostics] = useState<ScannerDiagnostics>(initialDiagnostics);
+
   const reassemblerRef = useRef<QrPayloadReassembler>(new QrPayloadReassembler());
-  const scanIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isGeneratingOfferRef = useRef(false);
 
@@ -123,10 +174,12 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
       setPackets([]);
       setActiveFrameIndex(0);
       setCachedQrUrls([]);
+      setAutoCycle(false);
       setIsPaused(false);
       setScannerTestMode(false);
       setScannerTestResult(null);
       setLastScannedFrame(null);
+      setDiagnostics(initialDiagnostics);
       isGeneratingOfferRef.current = false;
       reassemblerRef.current.reset();
 
@@ -229,7 +282,11 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
       setPackets(generatedPackets);
       setActiveFrameIndex(0);
       setPhase('WAITING_FOR_RECEIVER');
-      setStatusMessage('Show this Offer QR code to the receiver.');
+      setStatusMessage(
+        generatedPackets.length === 1
+          ? 'Show this static Offer QR code to the receiver.'
+          : `Show this Offer QR code to the receiver (${generatedPackets.length} frames).`
+      );
     } catch (err: any) {
       console.error(`[DIAG ERROR] [${new Date().toISOString()}] Failed to create offer payloads:`, err);
       setPhase('FAILED');
@@ -270,7 +327,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
         if (!active) return;
         const duration = (performance.now() - renderStartTime).toFixed(1);
         console.log(
-          `[DIAG 15] All ${urls.length} QR frame(s) pre-rendered in ${duration}ms! Frame byte lengths: ${urls.map(u => u.length).join(', ')}`
+          `[DIAG 15] All ${urls.length} QR frame(s) pre-rendered in ${duration}ms! Frame lengths: ${urls.map(u => u.length).join(', ')}`
         );
         setCachedQrUrls(urls);
       })
@@ -285,7 +342,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     };
   }, [packets]);
 
-  // Multi-frame QR auto-cycling with 4.5s interval and pause support
+  // Multi-frame QR auto-cycling (disabled by default, user-controllable)
   useEffect(() => {
     const isShowingQr = phase === 'WAITING_FOR_RECEIVER' || phase === 'WAITING_FOR_SENDER';
     if (packets.length <= 1 || !autoCycle || !isShowingQr || isPaused) return;
@@ -310,59 +367,104 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
   const startCamera = async () => {
     stopCamera();
     setCameraError(null);
+    setDiagnostics(initialDiagnostics);
 
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
       setCameraError('Camera access not supported in this browser. Use manual payload entry below.');
+      setDiagnostics((prev) => ({
+        ...prev,
+        lastError: 'getUserMedia not supported in this browser environment'
+      }));
       return;
     }
 
     try {
-      // Request environment camera with continuous autofocus
-      const stream = await navigator.mediaDevices.getUserMedia({
+      // Request environment camera with ideal 1280x720 and continuous autofocus
+      const constraints: MediaStreamConstraints = {
         video: {
           facingMode: { ideal: 'environment' },
           width: { ideal: 1280 },
-          height: { ideal: 720 },
-          advanced: [{ focusMode: 'continuous' } as any]
+          height: { ideal: 720 }
         }
-      });
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       mediaStreamRef.current = stream;
 
-      // Apply continuous autofocus on supported hardware tracks
+      // Apply continuous autofocus on supported tracks
       const track = stream.getVideoTracks()[0];
       if (track) {
-        const caps: any = track.getCapabilities ? track.getCapabilities() : {};
-        if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
-          try {
+        try {
+          const caps: any = track.getCapabilities ? track.getCapabilities() : {};
+          if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
             await (track as any).applyConstraints({
               advanced: [{ focusMode: 'continuous' }]
             });
-            console.log('[DIAG CAMERA] Applied continuous autofocus constraint');
-          } catch (e) {
-            console.warn('[DIAG CAMERA] Continuous autofocus not supported on this device track:', e);
+            console.log('[DIAG CAMERA] Continuous autofocus applied');
           }
+        } catch (e) {
+          console.warn('[DIAG CAMERA] Continuous autofocus not supported on this device track:', e);
         }
       }
 
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         videoRef.current.setAttribute('playsinline', 'true');
+        videoRef.current.muted = true;
         await videoRef.current.play();
       }
+
+      const vw = videoRef.current?.videoWidth || 1280;
+      const vh = videoRef.current?.videoHeight || 720;
       setCameraActive(true);
-      startBarcodeDetection();
+      setDiagnostics((prev) => ({
+        ...prev,
+        cameraActive: true,
+        cameraResolution: `${vw}x${vh}`
+      }));
+
+      // Initialize BarcodeDetector if available and supported
+      let detector: any = null;
+      let detectorName = 'jsQR (Pure JS Universal Fallback)';
+      if (typeof window !== 'undefined' && 'BarcodeDetector' in window) {
+        try {
+          if (typeof (window as any).BarcodeDetector.getSupportedFormats === 'function') {
+            const formats: string[] = await (window as any).BarcodeDetector.getSupportedFormats();
+            if (formats.includes('qr_code')) {
+              detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
+              detectorName = 'Dual (BarcodeDetector + jsQR Fallback)';
+            }
+          } else {
+            detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
+            detectorName = 'Dual (BarcodeDetector + jsQR Fallback)';
+          }
+        } catch (e: any) {
+          console.warn('[DIAG SCANNER] BarcodeDetector init failed, using jsQR fallback:', e);
+          detector = null;
+        }
+      }
+      barcodeDetectorRef.current = detector;
+      setDiagnostics((prev) => ({
+        ...prev,
+        decoderInit: detectorName
+      }));
+
+      // Start continuous scanning loop
+      startScanningLoop();
     } catch (err: any) {
       console.warn('Camera access denied or failed:', err);
-      setCameraError('Camera access unavailable. Use manual payload entry below.');
+      setCameraError(err.message || 'Camera access unavailable. Use manual payload entry below.');
       setCameraActive(false);
+      setDiagnostics((prev) => ({
+        ...prev,
+        lastError: `Camera initialization error: ${err.message || 'Permission denied'}`
+      }));
     }
   };
 
   const stopCamera = () => {
-    if (scanIntervalRef.current) {
-      clearInterval(scanIntervalRef.current);
-      scanIntervalRef.current = null;
-    }
+    isScanningActiveRef.current = false;
+    isDecodingRef.current = false;
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
@@ -370,30 +472,96 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     setCameraActive(false);
   };
 
-  const startBarcodeDetection = () => {
-    if (scanIntervalRef.current) clearInterval(scanIntervalRef.current);
+  const startScanningLoop = () => {
+    isScanningActiveRef.current = true;
+    let attempts = 0;
 
-    if (typeof window !== 'undefined' && 'BarcodeDetector' in window) {
-      try {
-        const detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
-        scanIntervalRef.current = setInterval(async () => {
-          if (!videoRef.current || videoRef.current.readyState < 2) return;
-          try {
-            const barcodes = await detector.detect(videoRef.current);
-            if (barcodes.length > 0) {
-              handleScannedPayload(barcodes[0].rawValue);
+    const scanFrame = async () => {
+      if (!isScanningActiveRef.current) return;
+      const video = videoRef.current;
+
+      if (video && video.readyState >= 2 && video.videoWidth > 0 && !isDecodingRef.current) {
+        isDecodingRef.current = true;
+        attempts++;
+        if (attempts % 4 === 0) {
+          setDiagnostics((prev) => ({ ...prev, scanAttempts: attempts }));
+        }
+
+        try {
+          let decodedText: string | null = null;
+          let engineUsed: 'BarcodeDetector' | 'jsQR' | 'None' = 'None';
+
+          // Engine 1: BarcodeDetector
+          if (barcodeDetectorRef.current) {
+            try {
+              const barcodes = await barcodeDetectorRef.current.detect(video);
+              if (barcodes && barcodes.length > 0 && barcodes[0].rawValue) {
+                decodedText = barcodes[0].rawValue;
+                engineUsed = 'BarcodeDetector';
+              }
+            } catch {
+              // BarcodeDetector threw - proceed directly to jsQR fallback
             }
-          } catch {
-            // Transient frame processing error, ignore
           }
-        }, 150); // Fast 150ms scan cycle
-        return;
-      } catch (err) {
-        console.warn('BarcodeDetector initialization failed:', err);
-      }
-    }
 
-    setCameraError('Native QR scanner unavailable in this browser. Use manual payload entry below.');
+          // Engine 2: jsQR Fallback on canvas ImageData
+          if (!decodedText) {
+            const vw = video.videoWidth;
+            const vh = video.videoHeight;
+            const canvas = canvasRef.current || document.createElement('canvas');
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+            if (ctx) {
+              // Scale to max 640px wide for rapid decoding without losing QR module resolution
+              const scale = Math.min(1, 640 / vw);
+              const w = Math.floor(vw * scale);
+              const h = Math.floor(vh * scale);
+              if (canvas.width !== w || canvas.height !== h) {
+                canvas.width = w;
+                canvas.height = h;
+              }
+
+              ctx.drawImage(video, 0, 0, w, h);
+              const imgData = ctx.getImageData(0, 0, w, h);
+              const qrResult = jsQR(imgData.data, w, h, { inversionAttempts: 'attemptBoth' });
+
+              if (qrResult && qrResult.data) {
+                decodedText = qrResult.data;
+                engineUsed = 'jsQR';
+              }
+            }
+          }
+
+          if (decodedText) {
+            lastDecoderUsedRef.current = engineUsed;
+            setDiagnostics((prev) => ({
+              ...prev,
+              scanAttempts: attempts,
+              qrDetected: true,
+              qrDetectedLength: decodedText!.length,
+              decoderUsed: engineUsed
+            }));
+            console.log(`[DIAG SCANNER] Recognized QR Code via ${engineUsed}! Length: ${decodedText.length}`);
+            await handleScannedPayload(decodedText);
+          }
+        } catch (frameErr: any) {
+          console.warn('[DIAG SCANNER] Frame processing exception:', frameErr);
+        } finally {
+          isDecodingRef.current = false;
+        }
+      }
+
+      if (isScanningActiveRef.current) {
+        // Throttle ~80ms to provide smooth 12fps scanning with negligible CPU usage
+        setTimeout(() => {
+          if (isScanningActiveRef.current) {
+            requestAnimationFrame(scanFrame);
+          }
+        }, 80);
+      }
+    };
+
+    requestAnimationFrame(scanFrame);
   };
 
   const handleScannedPayload = async (rawText: string) => {
@@ -403,29 +571,45 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
         try {
           const parsed = JSON.parse(rawText);
           if (parsed.peerport === 'scanner-test') {
-            setScannerTestResult('Success: Camera successfully decoded test QR code! Autofocus and scanner verified.');
+            setScannerTestResult(`✓ Test QR Code Verified! (${rawText.length} chars decoded via ${lastDecoderUsedRef.current})`);
             return;
           }
         } catch {
-          // Non-JSON scan in test mode
+          // Non-JSON in test mode
         }
-        setScannerTestResult(`Recognized QR Code (${rawText.length} chars): ${rawText.slice(0, 40)}...`);
+        setScannerTestResult(`Recognized QR (${rawText.length} chars via ${lastDecoderUsedRef.current}): ${rawText.slice(0, 40)}...`);
         return;
       }
 
+      // Step 6: Parse & validate packet
       const packet = parseAndValidateQrPayload(rawText);
-      const expectedSession = role === 'SENDER' ? sessionId : undefined;
+      setDiagnostics((prev) => ({
+        ...prev,
+        jsonParsed: true,
+        packetType: packet.type,
+        framesReceived: `Frame ${packet.idx + 1} of ${packet.total}`
+      }));
 
+      const expectedSession = role === 'SENDER' ? sessionId : undefined;
       const result = await reassemblerRef.current.processPacket(packet, expectedSession);
       const progress = reassemblerRef.current.getProgress();
       setScanProgress(progress);
       setLastScannedFrame(packet.idx + 1);
 
       if (result) {
+        // Step 9 & 10: Reassembled and Decompressed
+        setDiagnostics((prev) => ({
+          ...prev,
+          payloadReassembled: true,
+          sdpDecompressed: true,
+          sdpLength: result.sdp.length
+        }));
+
         stopCamera();
 
         if (role === 'SENDER' && result.type === 'answer') {
           // Sender received answer -> Connecting
+          setDiagnostics((prev) => ({ ...prev, remoteAccepted: true }));
           setPhase('CONNECTING');
           setStatusMessage('Applying remote answer and establishing connection...');
           if (transport) {
@@ -433,20 +617,35 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
           }
         } else if (role === 'RECEIVER' && result.type === 'offer') {
           // Receiver received offer -> Generating Answer
+          setDiagnostics((prev) => ({
+            ...prev,
+            remoteAccepted: true,
+            answerStarted: true
+          }));
           setPhase('GENERATING_ANSWER');
           setStatusMessage('Processing offer and generating local answer...');
           if (transport) {
             onSessionReady?.('RECEIVER', result.sessionId);
             const answerPackets = await transport.createAnswerPayloads(result.sessionId, result.sdp);
+            setDiagnostics((prev) => ({
+              ...prev,
+              answerRendered: true
+            }));
             setPackets(answerPackets);
             setActiveFrameIndex(0);
             setPhase('WAITING_FOR_SENDER');
-            setStatusMessage('Show this Answer QR code to the sender to finalize the link.');
+            setStatusMessage(
+              answerPackets.length === 1
+                ? 'Show this static Answer QR code to the sender.'
+                : `Show this Answer QR code to the sender (${answerPackets.length} frames).`
+            );
           }
         }
       }
     } catch (err: any) {
+      console.error('[DIAG SCANNER] Error handling scanned payload:', err);
       setManualError(err.message || 'Invalid QR payload format');
+      setDiagnostics((prev) => ({ ...prev, lastError: err.message || 'Format error' }));
     }
   };
 
@@ -475,6 +674,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     setScannerTestMode(false);
     setScannerTestResult(null);
     setLastScannedFrame(null);
+    setDiagnostics(initialDiagnostics);
     reassemblerRef.current.reset();
 
     if (onRetry) {
@@ -540,6 +740,9 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
           </p>
         </div>
 
+        {/* Hidden offscreen canvas for jsQR image extraction */}
+        <canvas ref={canvasRef} className="hidden" />
+
         {/* INDEPENDENT QR SCANNER TEST TOOL */}
         {scannerTestMode && (
           <div className="w-full mb-5 p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-800 text-xs animate-fade-in">
@@ -575,7 +778,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
               </div>
             ) : (
               <div className="text-center text-amber-700 dark:text-amber-400 font-medium text-[11px]">
-                Aim camera at test QR code...
+                Aim camera at test QR code... (Attempts: {diagnostics.scanAttempts})
               </div>
             )}
           </div>
@@ -634,7 +837,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
                 <>
                   <p>• Ensure both devices are connected to the same Wi-Fi network or mobile hotspot.</p>
                   <p>• Turning mobile data OFF on the hotspot phone does not affect Wi-Fi. Keep Wi-Fi active.</p>
-                  <p>• If using multi-frame QR codes, ensure all frames (1 of 2, 2 of 2) are scanned by the receiver camera.</p>
+                  <p>• If using multi-frame QR codes, ensure all frames are scanned by the receiver camera.</p>
                   <p>• Test your camera and scanner independently using the <strong>Test Scanner</strong> button in the header.</p>
                 </>
               )}
@@ -683,7 +886,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
           </div>
         )}
 
-        {/* SENDER STEP 1: Offer QR Display */}
+        {/* SENDER STEP 1: Offer QR Display (Prioritizing ONE Static QR) */}
         {!scannerTestMode && role === 'SENDER' && (phase === 'CREATING_OFFER' || phase === 'GENERATING_QR' || phase === 'WAITING_FOR_RECEIVER') && (
           <div className="flex flex-col items-center animate-fade-in">
             <div className="w-full p-3 rounded-xl bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 mb-4 text-xs text-sky-800 dark:text-sky-300">
@@ -717,20 +920,20 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
               </div>
             )}
 
-            {/* Frame navigation & auto-cycle controls */}
+            {/* Frame navigation controls (Fallback only if multi-frame required) */}
             {packets.length > 1 && (
               <div className="w-full flex flex-col items-center gap-2 mb-3">
                 <div className="flex items-center gap-2">
                   <span className="px-3 py-1 rounded-full bg-sky-100 dark:bg-sky-900/60 text-sky-800 dark:text-sky-200 font-bold text-xs">
                     Frame {activeFrameIndex + 1} of {packets.length}
                   </span>
-                  {isPaused ? (
-                    <span className="px-2 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 font-semibold text-[11px]">
-                      Paused (Hold on camera)
-                    </span>
-                  ) : (
+                  {autoCycle && !isPaused ? (
                     <span className="px-2 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 font-semibold text-[11px]">
                       Auto-cycle: 4.5s
+                    </span>
+                  ) : (
+                    <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-semibold text-[11px]">
+                      Static (Manual Navigation)
                     </span>
                   )}
                 </div>
@@ -785,11 +988,18 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
                   <button
                     type="button"
-                    onClick={() => setIsPaused(!isPaused)}
+                    onClick={() => {
+                      if (!autoCycle) {
+                        setAutoCycle(true);
+                        setIsPaused(false);
+                      } else {
+                        setIsPaused(!isPaused);
+                      }
+                    }}
                     className="px-2.5 py-1.5 rounded-xl text-xs font-semibold bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 flex items-center gap-1 transition-colors"
                   >
-                    {isPaused ? <Play className="w-3.5 h-3.5 text-emerald-500" /> : <Pause className="w-3.5 h-3.5 text-amber-500" />}
-                    <span>{isPaused ? 'Resume' : 'Pause'}</span>
+                    {autoCycle && !isPaused ? <Pause className="w-3.5 h-3.5 text-amber-500" /> : <Play className="w-3.5 h-3.5 text-emerald-500" />}
+                    <span>{autoCycle && !isPaused ? 'Pause' : 'Auto-Cycle'}</span>
                   </button>
                 </div>
               </div>
@@ -838,15 +1048,31 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
               )}
             </div>
 
-            {scanProgress.total > 1 && (
-              <div className="text-xs text-sky-600 dark:text-sky-400 font-bold mb-3 flex items-center gap-1.5">
-                <Check className="w-4 h-4 text-emerald-500" />
-                <span>
-                  Scanned {scanProgress.received} of {scanProgress.total} answer frames
-                  {lastScannedFrame && ` (Last: Frame ${lastScannedFrame})`}
+            {/* Real-Time Visible Scanner Diagnostics Panel */}
+            <div className="w-full mb-3 p-3 rounded-2xl bg-slate-900 border border-slate-700 text-[11px] font-mono text-slate-300">
+              <div className="flex items-center justify-between font-bold text-slate-200 mb-2 pb-1 border-b border-slate-800">
+                <span className="flex items-center gap-1.5">
+                  <Activity className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Real-Time Scanner Diagnostics</span>
                 </span>
+                <span className="text-[10px] text-amber-400 font-bold">{diagnostics.scanAttempts} scans</span>
               </div>
-            )}
+              <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px]">
+                <div>1. Camera: <span className={diagnostics.cameraActive ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.cameraActive ? `✓ ${diagnostics.cameraResolution}` : '○ Inactive'}</span></div>
+                <div>2. Decoder: <span className="text-sky-400">{diagnostics.decoderInit}</span></div>
+                <div>3. QR Detected: <span className={diagnostics.qrDetected ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.qrDetected ? `✓ ${diagnostics.qrDetectedLength} chars` : '○ Scanning...'}</span></div>
+                <div>4. Engine Used: <span className="text-emerald-400">{diagnostics.decoderUsed}</span></div>
+                <div>5. JSON Packet: <span className={diagnostics.jsonParsed ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.jsonParsed ? `✓ ${diagnostics.packetType}` : '○ Pending'}</span></div>
+                <div>6. Reassembled: <span className={diagnostics.payloadReassembled ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.payloadReassembled ? '✓ Complete' : '○ Pending'}</span></div>
+                <div>7. Decompressed: <span className={diagnostics.sdpDecompressed ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.sdpDecompressed ? `✓ ${diagnostics.sdpLength} chars` : '○ Pending'}</span></div>
+                <div>8. Link State: <span className={diagnostics.remoteAccepted ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.remoteAccepted ? '✓ Answer Applied' : '○ Waiting'}</span></div>
+              </div>
+              {diagnostics.lastError && (
+                <div className="mt-2 pt-1 border-t border-slate-800 text-rose-400 font-semibold">
+                  Error: {diagnostics.lastError}
+                </div>
+              )}
+            </div>
 
             {/* Manual fallback input */}
             {(cameraError || !cameraActive) && (
@@ -910,15 +1136,33 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
               )}
             </div>
 
-            {scanProgress.total > 1 && (
-              <div className="text-xs text-emerald-600 dark:text-emerald-400 font-bold mb-3 flex items-center gap-1.5">
-                <Check className="w-4 h-4 text-emerald-500" />
-                <span>
-                  Scanned {scanProgress.received} of {scanProgress.total} offer frames
-                  {lastScannedFrame && ` (Captured Frame ${lastScannedFrame}! Point at next)`}
+            {/* Real-Time Visible Scanner Diagnostics Panel */}
+            <div className="w-full mb-3 p-3 rounded-2xl bg-slate-900 border border-slate-700 text-[11px] font-mono text-slate-300">
+              <div className="flex items-center justify-between font-bold text-slate-200 mb-2 pb-1 border-b border-slate-800">
+                <span className="flex items-center gap-1.5">
+                  <Activity className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Real-Time Scanner Diagnostics</span>
                 </span>
+                <span className="text-[10px] text-amber-400 font-bold">{diagnostics.scanAttempts} scans</span>
               </div>
-            )}
+              <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px]">
+                <div>1. Camera: <span className={diagnostics.cameraActive ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.cameraActive ? `✓ ${diagnostics.cameraResolution}` : '○ Inactive'}</span></div>
+                <div>2. Decoder: <span className="text-sky-400">{diagnostics.decoderInit}</span></div>
+                <div>3. QR Detected: <span className={diagnostics.qrDetected ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.qrDetected ? `✓ ${diagnostics.qrDetectedLength} chars` : '○ Scanning...'}</span></div>
+                <div>4. Engine Used: <span className="text-emerald-400">{diagnostics.decoderUsed}</span></div>
+                <div>5. JSON Packet: <span className={diagnostics.jsonParsed ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.jsonParsed ? `✓ ${diagnostics.packetType}` : '○ Pending'}</span></div>
+                <div>6. Reassembled: <span className={diagnostics.payloadReassembled ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.payloadReassembled ? '✓ Complete' : '○ Pending'}</span></div>
+                <div>7. Decompressed: <span className={diagnostics.sdpDecompressed ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.sdpDecompressed ? `✓ ${diagnostics.sdpLength} chars` : '○ Pending'}</span></div>
+                <div>8. Offer Applied: <span className={diagnostics.remoteAccepted ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.remoteAccepted ? '✓ Applied' : '○ Pending'}</span></div>
+                <div>9. Answer Started: <span className={diagnostics.answerStarted ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.answerStarted ? '✓ In Progress' : '○ Pending'}</span></div>
+                <div>10. Answer Rendered: <span className={diagnostics.answerRendered ? 'text-emerald-400 font-bold' : 'text-slate-500'}>{diagnostics.answerRendered ? '✓ Ready' : '○ Pending'}</span></div>
+              </div>
+              {diagnostics.lastError && (
+                <div className="mt-2 pt-1 border-t border-slate-800 text-rose-400 font-semibold">
+                  Error: {diagnostics.lastError}
+                </div>
+              )}
+            </div>
 
             {/* Manual fallback input */}
             {(cameraError || !cameraActive) && (
@@ -952,7 +1196,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
           </div>
         )}
 
-        {/* RECEIVER STEP 2: Show Answer QR */}
+        {/* RECEIVER STEP 2: Show Answer QR (Prioritizing ONE Static QR) */}
         {!scannerTestMode && role === 'RECEIVER' && (phase === 'GENERATING_ANSWER' || phase === 'WAITING_FOR_SENDER') && (
           <div className="flex flex-col items-center animate-fade-in">
             <div className="w-full p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 mb-4 text-xs text-emerald-800 dark:text-emerald-300">
@@ -986,20 +1230,20 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
               </div>
             )}
 
-            {/* Frame navigation & auto-cycle controls */}
+            {/* Frame navigation controls (Fallback only if multi-frame required) */}
             {packets.length > 1 && (
               <div className="w-full flex flex-col items-center gap-2 mb-3">
                 <div className="flex items-center gap-2">
                   <span className="px-3 py-1 rounded-full bg-emerald-100 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200 font-bold text-xs">
                     Frame {activeFrameIndex + 1} of {packets.length}
                   </span>
-                  {isPaused ? (
-                    <span className="px-2 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 font-semibold text-[11px]">
-                      Paused (Hold on camera)
-                    </span>
-                  ) : (
+                  {autoCycle && !isPaused ? (
                     <span className="px-2 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 font-semibold text-[11px]">
                       Auto-cycle: 4.5s
+                    </span>
+                  ) : (
+                    <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-semibold text-[11px]">
+                      Static (Manual Navigation)
                     </span>
                   )}
                 </div>
@@ -1053,24 +1297,33 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
                   <button
                     type="button"
-                    onClick={() => setIsPaused(!isPaused)}
+                    onClick={() => {
+                      if (!autoCycle) {
+                        setAutoCycle(true);
+                        setIsPaused(false);
+                      } else {
+                        setIsPaused(!isPaused);
+                      }
+                    }}
                     className="px-2.5 py-1.5 rounded-xl text-xs font-semibold bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 flex items-center gap-1 transition-colors"
                   >
-                    {isPaused ? <Play className="w-3.5 h-3.5 text-emerald-500" /> : <Pause className="w-3.5 h-3.5 text-amber-500" />}
-                    <span>{isPaused ? 'Resume' : 'Pause'}</span>
+                    {autoCycle && !isPaused ? <Pause className="w-3.5 h-3.5 text-amber-500" /> : <Play className="w-3.5 h-3.5 text-emerald-500" />}
+                    <span>{autoCycle && !isPaused ? 'Pause' : 'Auto-Cycle'}</span>
                   </button>
                 </div>
               </div>
             )}
 
-            <button
-              type="button"
-              onClick={handleCopyCurrentPacket}
-              className="w-full py-2.5 px-3 rounded-xl border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
-            >
-              {copied ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
-              <span>{copied ? 'Copied' : 'Copy Payload'}</span>
-            </button>
+            <div className="flex items-center gap-2 w-full mt-2">
+              <button
+                type="button"
+                onClick={handleCopyCurrentPacket}
+                className="flex-1 py-2.5 px-3 rounded-xl border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
+              >
+                {copied ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
+                <span>{copied ? 'Copied' : 'Copy Payload'}</span>
+              </button>
+            </div>
           </div>
         )}
       </div>

@@ -21,7 +21,7 @@ export interface QrSignalingPacket {
 
 export const QR_SIGNALING_VERSION = 1;
 export const DEFAULT_QR_EXPIRATION_MS = 5 * 60 * 1000; // 5 minutes
-export const DEFAULT_MAX_CHUNK_LENGTH = 520; // Maximum data slice characters per QR frame
+export const DEFAULT_MAX_CHUNK_LENGTH = 1100; // Single-frame capacity for static QR negotiation (fallback to multi-frame only if exceeded)
 
 export interface AnalyzedCandidate {
   raw: string;
@@ -39,12 +39,12 @@ export interface AnalyzedCandidate {
  */
 export function parseIceCandidateString(candStr: string): AnalyzedCandidate | null {
   if (!candStr || typeof candStr !== 'string') return null;
-  const parts = candStr.trim().replace(/^candidate:/, '').split(/\s+/);
+  const parts = candStr.trim().replace(/^(?:a=)?candidate:/, '').split(/\s+/);
   if (parts.length < 6) return null;
 
-  const protocol = parts[1]?.toUpperCase() || 'UDP';
-  const address = parts[3] || '';
-  const port = parseInt(parts[4] || '0', 10);
+  const protocol = parts[2]?.toUpperCase() || 'UDP';
+  const address = parts[4] || '';
+  const port = parseInt(parts[5] || '0', 10);
   const typeIndex = parts.indexOf('typ');
   const type = typeIndex !== -1 ? parts[typeIndex + 1] || 'host' : 'host';
 
@@ -70,7 +70,7 @@ export function parseIceCandidateString(candStr: string): AnalyzedCandidate | nu
 /**
  * Prunes redundant RTP audio/video lines from a WebRTC SDP that are unused by DataChannels.
  * Strips RTP header extensions (a=extmap:), media stream semantics (a=msid-semantic:),
- * and RTCP attributes, reducing uncompressed SDP size by ~35% without affecting SCTP DataChannel negotiation.
+ * and RTCP attributes, reducing uncompressed SDP size by ~35-40% without affecting SCTP DataChannel negotiation.
  */
 export function pruneSdpForDataChannel(sdp: string): string {
   if (!sdp) return '';
@@ -80,11 +80,17 @@ export function pruneSdpForDataChannel(sdp: string): string {
       const trimmed = line.trim();
       if (!trimmed) return false;
       if (trimmed.startsWith('a=extmap:')) return false;
+      if (trimmed.startsWith('a=extmap-allow-mixed')) return false;
       if (trimmed.startsWith('a=msid-semantic:')) return false;
       if (trimmed.startsWith('a=msid:')) return false;
       if (trimmed.startsWith('a=rtcp:')) return false;
       if (trimmed.startsWith('a=rtcp-mux')) return false;
       if (trimmed.startsWith('a=rtcp-rsize')) return false;
+      if (trimmed.startsWith('a=rtcp-fb:')) return false;
+      if (trimmed.startsWith('a=simulcast:')) return false;
+      if (trimmed.startsWith('a=rid:')) return false;
+      if (trimmed.startsWith('a=maxptime:')) return false;
+      if (trimmed.startsWith('a=ptime:')) return false;
       return true;
     })
     .join('\r\n') + '\r\n';
