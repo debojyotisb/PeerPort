@@ -58,31 +58,50 @@ export function base64ToUint8Array(base64: string): Uint8Array {
  * Compresses an SDP string using the standard Deflate compression stream.
  */
 export async function compressSdp(sdp: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const bytes = encoder.encode(sdp);
+  const startTime = performance.now();
+  console.log(`[DIAG 11.1] [${new Date().toISOString()}] compressSdp started (input length: ${sdp.length} chars)`);
+  try {
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(sdp);
 
-  const cs = new CompressionStream('deflate');
-  const writer = cs.writable.getWriter();
-  await writer.write(bytes as any);
-  await writer.close();
+    const cs = new CompressionStream('deflate');
+    const writer = cs.writable.getWriter();
+    let merged: Uint8Array;
 
-  const reader = cs.readable.getReader();
-  const chunks: Uint8Array[] = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) chunks.push(value);
+    if (typeof Response !== 'undefined') {
+      const readPromise = new Response(cs.readable).arrayBuffer();
+      await writer.write(bytes as any);
+      await writer.close();
+      merged = new Uint8Array(await readPromise);
+    } else {
+      await writer.write(bytes as any);
+      await writer.close();
+      const reader = cs.readable.getReader();
+      const chunks: Uint8Array[] = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) chunks.push(value);
+      }
+      const totalLength = chunks.reduce((acc, c) => acc + c.byteLength, 0);
+      merged = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const c of chunks) {
+        merged.set(c, offset);
+        offset += c.byteLength;
+      }
+    }
+
+    const compressedBase64 = uint8ArrayToBase64(merged);
+    const duration = (performance.now() - startTime).toFixed(1);
+    console.log(
+      `[DIAG 12] [${new Date().toISOString()}] SDP compression completed (duration: ${duration}ms, original: ${sdp.length} chars, compressed: ${compressedBase64.length} chars, ratio: ${(compressedBase64.length / sdp.length).toFixed(2)})`
+    );
+    return compressedBase64;
+  } catch (err: any) {
+    console.error(`[DIAG ERROR] [${new Date().toISOString()}] Exception in compressSdp:`, err);
+    throw err;
   }
-
-  const totalLength = chunks.reduce((acc, c) => acc + c.byteLength, 0);
-  const merged = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const c of chunks) {
-    merged.set(c, offset);
-    offset += c.byteLength;
-  }
-
-  return uint8ArrayToBase64(merged);
 }
 
 /**
@@ -93,23 +112,30 @@ export async function decompressSdp(base64: string): Promise<string> {
 
   const ds = new DecompressionStream('deflate');
   const writer = ds.writable.getWriter();
-  await writer.write(bytes as any);
-  await writer.close();
+  let merged: Uint8Array;
 
-  const reader = ds.readable.getReader();
-  const chunks: Uint8Array[] = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) chunks.push(value);
-  }
-
-  const totalLength = chunks.reduce((acc, c) => acc + c.byteLength, 0);
-  const merged = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const c of chunks) {
-    merged.set(c, offset);
-    offset += c.byteLength;
+  if (typeof Response !== 'undefined') {
+    const readPromise = new Response(ds.readable).arrayBuffer();
+    await writer.write(bytes as any);
+    await writer.close();
+    merged = new Uint8Array(await readPromise);
+  } else {
+    await writer.write(bytes as any);
+    await writer.close();
+    const reader = ds.readable.getReader();
+    const chunks: Uint8Array[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) chunks.push(value);
+    }
+    const totalLength = chunks.reduce((acc, c) => acc + c.byteLength, 0);
+    merged = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c, offset);
+      offset += c.byteLength;
+    }
   }
 
   const decoder = new TextDecoder();
@@ -165,6 +191,9 @@ export async function createQrPayloads(
     });
   }
 
+  console.log(
+    `[DIAG 13] [${new Date().toISOString()}] QR payload generation completed (packet count: ${packets.length}, type: ${type}, total bytes: ${compressedBase64.length})`
+  );
   return packets;
 }
 
@@ -316,26 +345,56 @@ export class QrPayloadReassembler {
  * Ensures all local host candidates are embedded in the SDP before QR generation.
  */
 export function waitForIceGathering(pc: RTCPeerConnection, timeoutMs = 2500): Promise<void> {
+  const startTime = performance.now();
+  console.log(`[DIAG 9] [${new Date().toISOString()}] ICE gathering started (initial iceGatheringState: ${pc.iceGatheringState})`);
+
   if (pc.iceGatheringState === 'complete') {
+    console.log(`[DIAG 10] [${new Date().toISOString()}] ICE gathering already complete (duration: 0.0ms, candidates count: in-sdp)`);
     return Promise.resolve();
   }
 
   return new Promise((resolve) => {
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let candidateCount = 0;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      pc.removeEventListener('icegatheringstatechange', checkState);
+      pc.removeEventListener('icecandidate', onCandidate);
+    };
+
+    const finish = (reason: string) => {
+      cleanup();
+      const duration = (performance.now() - startTime).toFixed(1);
+      console.log(
+        `[DIAG 10] [${new Date().toISOString()}] ICE gathering completed (reason: ${reason}, final state: ${pc.iceGatheringState}, duration: ${duration}ms, candidates count: ${candidateCount})`
+      );
+      resolve();
+    };
+
+    const onCandidate = (event: RTCPeerConnectionIceEvent) => {
+      if (event.candidate) {
+        candidateCount++;
+        console.log(`[DIAG 9.1] [${new Date().toISOString()}] Candidate gathered (#${candidateCount}): ${event.candidate.candidate.slice(0, 60)}...`);
+      } else {
+        console.log(`[DIAG 9.2] [${new Date().toISOString()}] Null candidate received (end of gathering)`);
+        finish('null-candidate');
+      }
+    };
 
     const checkState = () => {
+      console.log(`[DIAG 9.3] [${new Date().toISOString()}] icegatheringstatechange -> ${pc.iceGatheringState}`);
       if (pc.iceGatheringState === 'complete') {
-        if (timer) clearTimeout(timer);
-        pc.removeEventListener('icegatheringstatechange', checkState);
-        resolve();
+        finish('state-complete');
       }
     };
 
     pc.addEventListener('icegatheringstatechange', checkState);
+    pc.addEventListener('icecandidate', onCandidate);
 
     timer = setTimeout(() => {
-      pc.removeEventListener('icegatheringstatechange', checkState);
-      resolve();
+      console.warn(`[DIAG 9.4] [${new Date().toISOString()}] ICE gathering timeout reached (${timeoutMs}ms)`);
+      finish('timeout');
     }, timeoutMs);
   });
 }

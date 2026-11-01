@@ -72,28 +72,46 @@ export class AirGappedTransport implements PeerTransport {
    * compresses SDP offer, and returns QR signaling packets.
    */
   async createOfferPayloads(sessionId: string): Promise<QrSignalingPacket[]> {
+    const startTime = performance.now();
+    console.log(`[DIAG 2] [${new Date().toISOString()}] RTCPeerConnection creation started for session ${sessionId}`);
     this.currentSessionId = sessionId;
-    this.updateState('CONNECTING');
 
-    this.peerConnection = new RTCPeerConnection({ iceServers: [] });
-    this.setupPeerConnectionEvents();
+    try {
+      this.peerConnection = new RTCPeerConnection({ iceServers: [] });
+      console.log(`[DIAG 3] [${new Date().toISOString()}] RTCPeerConnection created successfully (iceServers: [])`);
+      this.setupPeerConnectionEvents();
 
-    this.dataChannel = this.peerConnection.createDataChannel('peerport-data', {
-      ordered: true
-    });
-    this.setupDataChannelEvents(this.dataChannel);
+      this.dataChannel = this.peerConnection.createDataChannel('peerport-data', {
+        ordered: true
+      });
+      this.setupDataChannelEvents(this.dataChannel);
+      console.log(`[DIAG 4] [${new Date().toISOString()}] createDataChannel completed (label: peerport-data, state: ${this.dataChannel.readyState})`);
 
-    const offer = await this.peerConnection.createOffer();
-    await this.peerConnection.setLocalDescription(offer);
+      console.log(`[DIAG 5] [${new Date().toISOString()}] createOffer started`);
+      const offerStart = performance.now();
+      const offer = await this.peerConnection.createOffer();
+      console.log(`[DIAG 6] [${new Date().toISOString()}] createOffer completed (duration: ${(performance.now() - offerStart).toFixed(1)}ms, offer SDP length: ${offer.sdp?.length})`);
 
-    // Wait for all local host candidates to be collected into localDescription.sdp
-    await waitForIceGathering(this.peerConnection);
+      console.log(`[DIAG 7] [${new Date().toISOString()}] setLocalDescription started`);
+      const setLocalStart = performance.now();
+      await this.peerConnection.setLocalDescription(offer);
+      console.log(`[DIAG 8] [${new Date().toISOString()}] setLocalDescription completed (duration: ${(performance.now() - setLocalStart).toFixed(1)}ms)`);
 
-    const sdp = this.peerConnection.localDescription?.sdp || offer.sdp || '';
-    if (!sdp.includes('candidate:')) {
-      console.warn('No local network candidates gathered. Ensure Wi-Fi or mobile hotspot is active.');
+      // Wait for all local host candidates to be collected into localDescription.sdp
+      await waitForIceGathering(this.peerConnection);
+
+      const sdp = this.peerConnection.localDescription?.sdp || offer.sdp || '';
+      console.log(`[DIAG 11] [${new Date().toISOString()}] SDP extracted (length: ${sdp.length}, hasCandidates: ${sdp.includes('candidate:')})`);
+      if (!sdp.includes('candidate:')) {
+        console.warn('No local network candidates gathered. Ensure Wi-Fi or mobile hotspot is active.');
+      }
+      const packets = await createQrPayloads(sessionId, 'offer', sdp);
+      console.log(`[DIAG 13.1] [${new Date().toISOString()}] createOfferPayloads completed in ${(performance.now() - startTime).toFixed(1)}ms (packets: ${packets.length})`);
+      return packets;
+    } catch (err: any) {
+      console.error(`[DIAG ERROR] [${new Date().toISOString()}] Exception in createOfferPayloads:`, err);
+      throw err;
     }
-    return await createQrPayloads(sessionId, 'offer', sdp);
   }
 
   /**
@@ -105,6 +123,7 @@ export class AirGappedTransport implements PeerTransport {
       throw new Error('PeerConnection not initialized. Offer must be created first.');
     }
 
+    this.updateState('CONNECTING');
     await this.peerConnection.setRemoteDescription(
       new RTCSessionDescription({ type: 'answer', sdp: answerSdp })
     );
@@ -130,7 +149,6 @@ export class AirGappedTransport implements PeerTransport {
    */
   async createAnswerPayloads(sessionId: string, offerSdp: string): Promise<QrSignalingPacket[]> {
     this.currentSessionId = sessionId;
-    this.updateState('CONNECTING');
 
     this.peerConnection = new RTCPeerConnection({ iceServers: [] });
     this.setupPeerConnectionEvents();

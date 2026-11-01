@@ -245,6 +245,8 @@ export const Home: React.FC = () => {
   };
 
   const handleStartAirGappedShare = async () => {
+    const diagTimestamp = new Date().toISOString();
+    console.log(`[DIAG 1] [${diagTimestamp}] Offline transfer button clicked (Role: SENDER, SelectedFiles: ${selectedFiles.length})`);
     if (selectedFiles.length === 0) {
       alert('Please select at least one file before generating an air-gapped QR transfer.');
       return;
@@ -255,6 +257,7 @@ export const Home: React.FC = () => {
     transportRef.current?.close();
 
     const sessionId = generateSecureId('ses');
+    console.log(`[DIAG 1.1] [${new Date().toISOString()}] Generated air-gapped sessionId: ${sessionId}`);
     setRoomId(sessionId);
     setRole('SENDER');
     setMode('QR_MANUAL');
@@ -274,11 +277,14 @@ export const Home: React.FC = () => {
   };
 
   const handleStartAirGappedReceive = async () => {
+    const diagTimestamp = new Date().toISOString();
+    console.log(`[DIAG 1] [${diagTimestamp}] Offline receive button clicked (Role: RECEIVER)`);
     transportCleanupRef.current?.();
     transportCleanupRef.current = null;
     transportRef.current?.close();
 
     const tempSessionId = generateSecureId('ses');
+    console.log(`[DIAG 1.1] [${new Date().toISOString()}] Generated air-gapped receive sessionId: ${tempSessionId}`);
     setRoomId(tempSessionId);
     setRole('RECEIVER');
     setMode('QR_MANUAL');

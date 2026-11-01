@@ -83,6 +83,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
   const reassemblerRef = useRef<QrPayloadReassembler>(new QrPayloadReassembler());
   const scanIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isGeneratingOfferRef = useRef(false);
 
   // Initialize role and workflow when modal opens
   useEffect(() => {
@@ -95,6 +96,7 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
       setPackets([]);
       setActiveFrameIndex(0);
       setQrDataUrl('');
+      isGeneratingOfferRef.current = false;
       reassemblerRef.current.reset();
 
       if (initialRole === 'SENDER') {
@@ -147,11 +149,21 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     // Triggered on connection state transitions
     unsubs.push(
       transport.subscribe('onConnectionStateChange', (state: any, reason?: string) => {
+        console.log(`[DIAG STATE] [${new Date().toISOString()}] AirGappedModal received onConnectionStateChange -> ${state} (current phase: ${phase}, reason: ${reason || 'none'})`);
         if (state === 'FAILED') {
           setPhase('FAILED');
           setErrorMessage(reason || 'Failed to establish direct peer connection. Check local network.');
           stopCamera();
-        } else if (state === 'CONNECTING' && phase !== 'CONNECTED') {
+        } else if (
+          state === 'CONNECTING' &&
+          phase !== 'CONNECTED' &&
+          phase !== 'CREATING_OFFER' &&
+          phase !== 'GENERATING_QR' &&
+          phase !== 'WAITING_FOR_RECEIVER' &&
+          phase !== 'GENERATING_ANSWER' &&
+          phase !== 'WAITING_FOR_SENDER'
+        ) {
+          console.warn(`[DIAG WARN] [${new Date().toISOString()}] Transitioning phase ${phase} -> CONNECTING`);
           setPhase('CONNECTING');
           setStatusMessage('Negotiating direct WebRTC link over local network...');
         }
@@ -165,7 +177,16 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
 
   // Sender: generate Offer payloads
   const startSenderOffer = async () => {
-    if (!transport) return;
+    if (!transport) {
+      console.warn(`[DIAG WARN] [${new Date().toISOString()}] startSenderOffer called without transport instance!`);
+      return;
+    }
+    if (isGeneratingOfferRef.current) {
+      console.log(`[DIAG DUP] [${new Date().toISOString()}] startSenderOffer already in progress, skipping duplicate invocation`);
+      return;
+    }
+    isGeneratingOfferRef.current = true;
+    console.log(`[DIAG START] [${new Date().toISOString()}] startSenderOffer started (sessionId: ${sessionId})`);
     setPhase('CREATING_OFFER');
     setStatusMessage('Generating local WebRTC offer with host candidates...');
     setErrorMessage(null);
@@ -173,14 +194,17 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     try {
       setPhase('GENERATING_QR');
       const generatedPackets = await transport.createOfferPayloads(sessionId);
+      console.log(`[DIAG OFFERS] [${new Date().toISOString()}] Generated packets received in modal: ${generatedPackets.length}`);
       setPackets(generatedPackets);
       setActiveFrameIndex(0);
       setPhase('WAITING_FOR_RECEIVER');
       setStatusMessage('Show this Offer QR code to the receiver.');
     } catch (err: any) {
-      console.error('Failed to create offer payloads:', err);
+      console.error(`[DIAG ERROR] [${new Date().toISOString()}] Failed to create offer payloads:`, err);
       setPhase('FAILED');
       setErrorMessage(err.message || 'Failed to gather local network addresses. Ensure Wi-Fi or hotspot is active.');
+    } finally {
+      isGeneratingOfferRef.current = false;
     }
   };
 
@@ -195,6 +219,11 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
     if (!currentPacket) return;
 
     const raw = JSON.stringify(currentPacket);
+    const renderStartTime = performance.now();
+    console.log(
+      `[DIAG 14] [${new Date().toISOString()}] QR rendering started (frame: ${activeFrameIndex + 1}/${packets.length}, payload length: ${raw.length} chars)`
+    );
+
     QRCode.toDataURL(raw, {
       width: 280,
       margin: 2,
@@ -204,8 +233,17 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
         light: '#ffffff'
       }
     })
-      .then((url) => setQrDataUrl(url))
-      .catch((err) => console.error('Error generating QR image:', err));
+      .then((url) => {
+        const duration = (performance.now() - renderStartTime).toFixed(1);
+        console.log(
+          `[DIAG 15] [${new Date().toISOString()}] QR rendering completed (duration: ${duration}ms, dataUrl length: ${url.length} chars)`
+        );
+        setQrDataUrl(url);
+      })
+      .catch((err) => {
+        console.error(`[DIAG ERROR] [${new Date().toISOString()}] Error generating QR image:`, err);
+        setErrorMessage(`QR generation error: ${err.message || 'Data too large for QR code'}`);
+      });
   }, [packets, activeFrameIndex]);
 
   // Multi-frame QR auto-cycling
@@ -502,8 +540,15 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
                 <span className="text-xs text-slate-500">Compressing local SDP offer...</span>
               </div>
             ) : (
-              <div className="p-3 bg-white rounded-2xl shadow-inner border border-slate-200 dark:border-slate-800 mb-3 flex flex-col items-center">
-                {qrDataUrl && <img src={qrDataUrl} alt="Offer QR" className="w-56 h-56 rounded-lg" />}
+              <div className="p-3 bg-white rounded-2xl shadow-inner border border-slate-200 dark:border-slate-800 mb-3 flex flex-col items-center min-w-[240px] min-h-[240px] justify-center">
+                {qrDataUrl ? (
+                  <img src={qrDataUrl} alt="Offer QR" className="w-56 h-56 rounded-lg" />
+                ) : (
+                  <div className="flex flex-col items-center justify-center p-6 text-center">
+                    <Loader2 className="w-8 h-8 animate-spin text-sky-500 mb-2" />
+                    <span className="text-xs text-slate-500">Rendering QR Code...</span>
+                  </div>
+                )}
               </div>
             )}
 
@@ -703,8 +748,15 @@ export const AirGappedModal: React.FC<AirGappedModalProps> = ({
                 <span className="text-xs text-slate-500">Generating local SDP answer...</span>
               </div>
             ) : (
-              <div className="p-3 bg-white rounded-2xl shadow-inner border border-slate-200 dark:border-slate-800 mb-3 flex flex-col items-center">
-                {qrDataUrl && <img src={qrDataUrl} alt="Answer QR" className="w-56 h-56 rounded-lg" />}
+              <div className="p-3 bg-white rounded-2xl shadow-inner border border-slate-200 dark:border-slate-800 mb-3 flex flex-col items-center min-w-[240px] min-h-[240px] justify-center">
+                {qrDataUrl ? (
+                  <img src={qrDataUrl} alt="Answer QR" className="w-56 h-56 rounded-lg" />
+                ) : (
+                  <div className="flex flex-col items-center justify-center p-6 text-center">
+                    <Loader2 className="w-8 h-8 animate-spin text-emerald-500 mb-2" />
+                    <span className="text-xs text-slate-500">Rendering QR Code...</span>
+                  </div>
+                )}
               </div>
             )}
 
