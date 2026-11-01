@@ -24,6 +24,36 @@ import {
   QrSignalingPacket
 } from './qr-signaling.js';
 
+/**
+ * Diagnoses RTCPeerConnection construction and WebRTC network interface failures.
+ * Distinguishes between browser-specific restrictions (e.g. Firefox offline enforcement)
+ * and genuine lack of an active local network interface.
+ */
+export function diagnosePeerConnectionError(err: any): Error {
+  const isFirefox = typeof navigator !== 'undefined' && /firefox/i.test(navigator.userAgent);
+  const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+  const errMsg = err?.message || String(err);
+
+  if (
+    errMsg.includes('network is down') ||
+    errMsg.includes('NS_ERROR_FAILURE') ||
+    (isFirefox && !isOnline)
+  ) {
+    const reason = isFirefox
+      ? "Firefox detected that the network route is down and blocked RTCPeerConnection creation. " +
+        "Firefox requires an active network route or 'network.manage-offline-status: false' in about:config. " +
+        "Remedy: On laptops, use Chrome or Edge for offline hotspot transfers, or in Firefox set about:config > network.manage-offline-status to false, and ensure Wi-Fi is connected to the phone hotspot."
+      : "No active local network interface detected. WebRTC requires an active local Wi-Fi or mobile hotspot connection. " +
+        "Please ensure Wi-Fi is turned ON on this device and connected to the other device's mobile hotspot or shared Wi-Fi network.";
+
+    const enhanced = new Error(`[WebRTC Network Offline] ${reason}`);
+    (enhanced as any).originalError = err;
+    return enhanced;
+  }
+
+  return err;
+}
+
 export class AirGappedTransport implements PeerTransport {
   readonly mode: TransportMode = 'QR_MANUAL';
   connectionState: ConnectionState = 'IDLE';
@@ -77,7 +107,14 @@ export class AirGappedTransport implements PeerTransport {
     this.currentSessionId = sessionId;
 
     try {
-      this.peerConnection = new RTCPeerConnection({ iceServers: [] });
+      try {
+        this.peerConnection = new RTCPeerConnection({ iceServers: [] });
+      } catch (pcErr: any) {
+        const diagnosed = diagnosePeerConnectionError(pcErr);
+        console.error(`[DIAG ERROR] [${new Date().toISOString()}] RTCPeerConnection constructor failed:`, diagnosed);
+        this.updateState('FAILED', diagnosed.message);
+        throw diagnosed;
+      }
       console.log(`[DIAG 3] [${new Date().toISOString()}] RTCPeerConnection created successfully (iceServers: [])`);
       this.setupPeerConnectionEvents();
 
@@ -150,7 +187,14 @@ export class AirGappedTransport implements PeerTransport {
   async createAnswerPayloads(sessionId: string, offerSdp: string): Promise<QrSignalingPacket[]> {
     this.currentSessionId = sessionId;
 
-    this.peerConnection = new RTCPeerConnection({ iceServers: [] });
+    try {
+      this.peerConnection = new RTCPeerConnection({ iceServers: [] });
+    } catch (pcErr: any) {
+      const diagnosed = diagnosePeerConnectionError(pcErr);
+      console.error(`[DIAG ERROR] [${new Date().toISOString()}] RTCPeerConnection constructor failed in createAnswerPayloads:`, diagnosed);
+      this.updateState('FAILED', diagnosed.message);
+      throw diagnosed;
+    }
     this.setupPeerConnectionEvents();
 
     await this.peerConnection.setRemoteDescription(

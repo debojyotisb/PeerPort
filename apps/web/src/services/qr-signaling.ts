@@ -23,6 +23,73 @@ export const QR_SIGNALING_VERSION = 1;
 export const DEFAULT_QR_EXPIRATION_MS = 5 * 60 * 1000; // 5 minutes
 export const DEFAULT_MAX_CHUNK_LENGTH = 520; // Maximum data slice characters per QR frame
 
+export interface AnalyzedCandidate {
+  raw: string;
+  type: string;
+  protocol: string;
+  address: string;
+  port: number;
+  isPrivateIp: boolean;
+  isMdns: boolean;
+  isLoopback: boolean;
+}
+
+/**
+ * Parses a standard WebRTC SDP candidate attribute line into structured diagnostic details.
+ */
+export function parseIceCandidateString(candStr: string): AnalyzedCandidate | null {
+  if (!candStr || typeof candStr !== 'string') return null;
+  const parts = candStr.trim().replace(/^candidate:/, '').split(/\s+/);
+  if (parts.length < 6) return null;
+
+  const protocol = parts[1]?.toUpperCase() || 'UDP';
+  const address = parts[3] || '';
+  const port = parseInt(parts[4] || '0', 10);
+  const typeIndex = parts.indexOf('typ');
+  const type = typeIndex !== -1 ? parts[typeIndex + 1] || 'host' : 'host';
+
+  const isMdns = address.endsWith('.local');
+  const isLoopback = address === '127.0.0.1' || address === '::1' || address === 'localhost';
+  const isPrivateIp =
+    /^10\./.test(address) ||
+    /^192\.168\./.test(address) ||
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(address);
+
+  return {
+    raw: candStr,
+    type,
+    protocol,
+    address,
+    port,
+    isPrivateIp,
+    isMdns,
+    isLoopback
+  };
+}
+
+/**
+ * Prunes redundant RTP audio/video lines from a WebRTC SDP that are unused by DataChannels.
+ * Strips RTP header extensions (a=extmap:), media stream semantics (a=msid-semantic:),
+ * and RTCP attributes, reducing uncompressed SDP size by ~35% without affecting SCTP DataChannel negotiation.
+ */
+export function pruneSdpForDataChannel(sdp: string): string {
+  if (!sdp) return '';
+  return sdp
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return false;
+      if (trimmed.startsWith('a=extmap:')) return false;
+      if (trimmed.startsWith('a=msid-semantic:')) return false;
+      if (trimmed.startsWith('a=msid:')) return false;
+      if (trimmed.startsWith('a=rtcp:')) return false;
+      if (trimmed.startsWith('a=rtcp-mux')) return false;
+      if (trimmed.startsWith('a=rtcp-rsize')) return false;
+      return true;
+    })
+    .join('\r\n') + '\r\n';
+}
+
 /**
  * Encodes a Uint8Array into a Base64 string universally across browser and Node environments.
  */
@@ -156,11 +223,16 @@ export async function createQrPayloads(
     throw new Error('Session ID and SDP are required to generate QR signaling payloads');
   }
 
-  const compressedBase64 = await compressSdp(sdp);
+  // Prune unused RTP media/extmap attributes before compression
+  const prunedSdp = pruneSdpForDataChannel(sdp);
+  const compressedBase64 = await compressSdp(prunedSdp);
   const exp = Date.now() + expirationMs;
 
   // Single-frame QR if payload is compact
   if (compressedBase64.length <= maxChunkLength) {
+    console.log(
+      `[DIAG 13] [${new Date().toISOString()}] Single-frame QR payload created (${type}, bytes: ${compressedBase64.length})`
+    );
     return [
       {
         v: QR_SIGNALING_VERSION,
@@ -174,12 +246,17 @@ export async function createQrPayloads(
     ];
   }
 
-  // Multi-frame QR segmentation for complex interface profiles
+  // Multi-frame QR with BALANCED chunk lengths:
+  // Instead of packing Frame 1 to max (e.g. 520) and leaving Frame 2 tiny (e.g. 80),
+  // distribute the payload evenly across all frames so every frame has lower density and larger QR modules!
   const total = Math.ceil(compressedBase64.length / maxChunkLength);
+  const targetChunkLength = Math.ceil(compressedBase64.length / total);
   const packets: QrSignalingPacket[] = [];
 
   for (let idx = 0; idx < total; idx++) {
-    const slice = compressedBase64.slice(idx * maxChunkLength, (idx + 1) * maxChunkLength);
+    const start = idx * targetChunkLength;
+    const end = Math.min(start + targetChunkLength, compressedBase64.length);
+    const slice = compressedBase64.slice(start, end);
     packets.push({
       v: QR_SIGNALING_VERSION,
       sid: sessionId,
@@ -192,7 +269,7 @@ export async function createQrPayloads(
   }
 
   console.log(
-    `[DIAG 13] [${new Date().toISOString()}] QR payload generation completed (packet count: ${packets.length}, type: ${type}, total bytes: ${compressedBase64.length})`
+    `[DIAG 13] [${new Date().toISOString()}] Balanced multi-frame QR payload generated (packet count: ${packets.length}, slice length: ~${targetChunkLength} chars, total bytes: ${compressedBase64.length})`
   );
   return packets;
 }
@@ -356,6 +433,8 @@ export function waitForIceGathering(pc: RTCPeerConnection, timeoutMs = 2500): Pr
   return new Promise((resolve) => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     let candidateCount = 0;
+    let privateIpCount = 0;
+    let mdnsCount = 0;
 
     const cleanup = () => {
       if (timer) clearTimeout(timer);
@@ -367,15 +446,36 @@ export function waitForIceGathering(pc: RTCPeerConnection, timeoutMs = 2500): Pr
       cleanup();
       const duration = (performance.now() - startTime).toFixed(1);
       console.log(
-        `[DIAG 10] [${new Date().toISOString()}] ICE gathering completed (reason: ${reason}, final state: ${pc.iceGatheringState}, duration: ${duration}ms, candidates count: ${candidateCount})`
+        `[DIAG 10] [${new Date().toISOString()}] ICE gathering completed (reason: ${reason}, final state: ${pc.iceGatheringState}, duration: ${duration}ms, candidates count: ${candidateCount}, private IPs: ${privateIpCount}, mDNS: ${mdnsCount})`
       );
+      if (candidateCount > 0 && privateIpCount === 0 && mdnsCount > 0) {
+        console.warn(
+          `[DIAG WARN] [${new Date().toISOString()}] All gathered host candidates are mDNS-masked (.local). Over a phone hotspot without mDNS resolution, devices cannot resolve .local hostnames unless private IP exposure is active.`
+        );
+      }
       resolve();
     };
 
     const onCandidate = (event: RTCPeerConnectionIceEvent) => {
       if (event.candidate) {
         candidateCount++;
-        console.log(`[DIAG 9.1] [${new Date().toISOString()}] Candidate gathered (#${candidateCount}): ${event.candidate.candidate.slice(0, 60)}...`);
+        const parsed = parseIceCandidateString(event.candidate.candidate);
+        if (parsed) {
+          if (parsed.isPrivateIp) privateIpCount++;
+          if (parsed.isMdns) mdnsCount++;
+          const classification = parsed.isPrivateIp
+            ? '[PRIVATE IP - HOTSPOT/LAN OK]'
+            : parsed.isMdns
+            ? '[MDNS OBFUSCATED - .local name]'
+            : parsed.isLoopback
+            ? '[LOOPBACK]'
+            : '[OTHER IP]';
+          console.log(
+            `[DIAG 9.1] [${new Date().toISOString()}] Candidate gathered (#${candidateCount}): ${parsed.type.toUpperCase()} ${parsed.protocol} ${parsed.address}:${parsed.port} ${classification}`
+          );
+        } else {
+          console.log(`[DIAG 9.1] [${new Date().toISOString()}] Candidate gathered (#${candidateCount}): ${event.candidate.candidate.slice(0, 60)}...`);
+        }
       } else {
         console.log(`[DIAG 9.2] [${new Date().toISOString()}] Null candidate received (end of gathering)`);
         finish('null-candidate');

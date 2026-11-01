@@ -6,6 +6,8 @@ import {
   parseAndValidateQrPayload,
   QrPayloadReassembler,
   waitForIceGathering,
+  pruneSdpForDataChannel,
+  parseIceCandidateString,
   QR_SIGNALING_VERSION,
   DEFAULT_MAX_CHUNK_LENGTH
 } from '../services/qr-signaling.js';
@@ -28,7 +30,56 @@ a=candidate:1 1 UDP 2130706431 192.168.43.100 54321 typ host
 a=candidate:2 1 UDP 2130706431 10.0.0.15 54322 typ host
 a=end-of-candidates`;
 
+const EXPECTED_PRUNED_SDP = pruneSdpForDataChannel(MOCK_SDP);
+
 describe('Air-Gapped QR Signaling Service', () => {
+  describe('SDP Pruning for DataChannel', () => {
+    it('strips redundant RTP audio/video lines (a=extmap:, a=msid:, a=rtcp:)', () => {
+      const verboseSdp = `${MOCK_SDP}
+a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid
+a=msid-semantic: WMS
+a=msid:stream1 track1
+a=rtcp:9 IN IP4 0.0.0.0
+a=rtcp-mux
+a=rtcp-rsize`;
+      const pruned = pruneSdpForDataChannel(verboseSdp);
+      expect(pruned).not.toContain('a=extmap:');
+      expect(pruned).not.toContain('a=msid-semantic:');
+      expect(pruned).not.toContain('a=msid:');
+      expect(pruned).not.toContain('a=rtcp:');
+      expect(pruned).not.toContain('a=rtcp-mux');
+      expect(pruned).not.toContain('a=rtcp-rsize');
+      expect(pruned).toContain('a=candidate:1');
+      expect(pruned).toContain('m=application');
+    });
+  });
+
+  describe('parseIceCandidateString diagnostic helper', () => {
+    it('correctly identifies private IP host candidate', () => {
+      const cand = parseIceCandidateString('candidate:1 1 UDP 2130706431 192.168.43.100 54321 typ host');
+      expect(cand).not.toBeNull();
+      expect(cand?.address).toBe('192.168.43.100');
+      expect(cand?.port).toBe(54321);
+      expect(cand?.isPrivateIp).toBe(true);
+      expect(cand?.isMdns).toBe(false);
+      expect(cand?.isLoopback).toBe(false);
+    });
+
+    it('correctly identifies mDNS obfuscated candidate', () => {
+      const cand = parseIceCandidateString('candidate:2 1 UDP 2130706431 a1b2c3d4-e5f6.local 54322 typ host');
+      expect(cand).not.toBeNull();
+      expect(cand?.address).toBe('a1b2c3d4-e5f6.local');
+      expect(cand?.isMdns).toBe(true);
+      expect(cand?.isPrivateIp).toBe(false);
+    });
+
+    it('correctly identifies loopback candidate', () => {
+      const cand = parseIceCandidateString('candidate:3 1 UDP 2130706431 127.0.0.1 54323 typ host');
+      expect(cand).not.toBeNull();
+      expect(cand?.isLoopback).toBe(true);
+    });
+  });
+
   describe('SDP Deflate Compression & Decompression', () => {
     it('compresses and accurately decompresses an SDP string', async () => {
       const compressed = await compressSdp(MOCK_SDP);
@@ -170,7 +221,7 @@ describe('Air-Gapped QR Signaling Service', () => {
       expect(result).not.toBeNull();
       expect(result?.sessionId).toBe('ses_single');
       expect(result?.type).toBe('offer');
-      expect(result?.sdp).toBe(MOCK_SDP);
+      expect(result?.sdp).toBe(EXPECTED_PRUNED_SDP);
     });
 
     it('reassembles multi-frame packets in sequential order', async () => {
@@ -188,7 +239,7 @@ describe('Air-Gapped QR Signaling Service', () => {
       expect(finalResult).not.toBeNull();
       expect(finalResult?.sessionId).toBe('ses_multi');
       expect(finalResult?.type).toBe('answer');
-      expect(finalResult?.sdp).toBe(MOCK_SDP);
+      expect(finalResult?.sdp).toBe(EXPECTED_PRUNED_SDP);
     });
 
     it('reassembles multi-frame packets received out of order', async () => {
@@ -204,7 +255,7 @@ describe('Air-Gapped QR Signaling Service', () => {
 
       const finalResult = await reassembler.processPacket(reversed[reversed.length - 1]);
       expect(finalResult).not.toBeNull();
-      expect(finalResult?.sdp).toBe(MOCK_SDP);
+      expect(finalResult?.sdp).toBe(EXPECTED_PRUNED_SDP);
     });
 
     it('safely handles duplicate scans of the same frame without double-counting', async () => {
@@ -221,7 +272,7 @@ describe('Air-Gapped QR Signaling Service', () => {
         await reassembler.processPacket(packets[i]);
       }
       const result = await reassembler.processPacket(packets[packets.length - 1]);
-      expect(result?.sdp).toBe(MOCK_SDP);
+      expect(result?.sdp).toBe(EXPECTED_PRUNED_SDP);
     });
 
     it('rejects mismatched session IDs when expectedSessionId is specified', async () => {
